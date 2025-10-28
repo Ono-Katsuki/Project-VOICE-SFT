@@ -4,6 +4,8 @@
 送信済みが含まれるスレッドを“返信も含めて”丸ごと取得（OAuth）
 - --all で全期間、--query で範囲指定
 - 各メッセージに direction: outbound/inbound を付与
+- 出力ファイル名にローカル部プレフィックスを付与
+- 認証後、<local>-token.json を保存（既存tokenも残す）
 """
 import argparse, base64, hashlib, html, json, os, re, sys, time
 from datetime import datetime, timezone
@@ -23,10 +25,10 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 _BR_RX = re.compile(r"(?i)<\s*br\s*/?>")
 _BLOCK_RX = re.compile(r"(?i)</\s*(p|div|li|h[1-6]|tr)\s*>")
 _TAG_RX = re.compile(r"<[^>]+>")
-SCRIPT_STYLE_RX = re.compile(r"(?is)<\s*(script|style)[^>]*>.*?</\s*\1\s*>")
-WS_RX = re.compile(r"[ \t\u3000]+")
-BLANKS_RX = re.compile(r"\n{3,}")
-FOOTER_PATTERNS = [
+_SCRIPT_STYLE_RX = re.compile(r"(?is)<\s*(script|style)[^>]*>.*?</\s*\1\s*>")
+_WS_RX = re.compile(r"[ \t\u3000]+")
+_BLANKS_RX = re.compile(r"\n{3,}")
+_FOOTER_PATTERNS = [
     r"^--\s*$",
     r"^Sent from my iPhone",
     r"^-{5,}\s*Original Message\s*-{5,}$",
@@ -36,27 +38,27 @@ FOOTER_PATTERNS = [
     r"^このメールは.*自動.*送信",
     r"^This email.*confidential",
 ]
-FOOTER_RX = re.compile("|".join(f"({p})" for p in FOOTER_PATTERNS), re.IGNORECASE | re.MULTILINE)
+_FOOTER_RX = re.compile("|".join(f"({p})" for p in _FOOTER_PATTERNS), re.IGNORECASE | re.MULTILINE)
 
 def html_to_text(s: str) -> str:
-    s = SCRIPT_STYLE_RX.sub("", s)
+    s = _SCRIPT_STYLE_RX.sub("", s)
     s = _BR_RX.sub("\n", s)
     s = _BLOCK_RX.sub("\n", s)
     s = _TAG_RX.sub("", s)
     s = html.unescape(s)
     s = s.replace("\r\n","\n").replace("\r","\n")
-    s = WS_RX.sub(" ", s)
-    s = BLANKS_RX.sub("\n\n", s)
+    s = _WS_RX.sub(" ", s)
+    s = _BLANKS_RX.sub("\n\n", s)
     return s.strip()
 
 def strip_footer_and_quotes(text: str) -> str:
-    m = FOOTER_RX.search(text)
+    m = _FOOTER_RX.search(text)
     if m:
         text = text[:m.start()]
     lines = text.split("\n")
     kept = [ln for ln in lines if not ln.lstrip().startswith(">")]
     text = "\n".join(kept)
-    text = BLANKS_RX.sub("\n\n", text).strip()
+    text = _BLANKS_RX.sub("\n\n", text).strip()
     return text
 
 # ---- ヘルパ ----
@@ -135,15 +137,38 @@ def parse_args():
 def main():
     args = parse_args()
     here = Path(__file__).resolve().parent
-    out_threads = Path(args.out_threads); out_threads.parent.mkdir(parents=True, exist_ok=True)
-    out_msgs = Path(args.messages_out) if args.messages_out else None
-    if out_msgs: out_msgs.parent.mkdir(parents=True, exist_ok=True)
 
     creds = get_creds(args.client_secret, args.token_file)
     svc = build("gmail","v1",credentials=creds, cache_discovery=False)
 
+    # プロファイルから自分のメール＆ローカル部
     prof = svc.users().getProfile(userId="me").execute()
     my_email = (prof.get("emailAddress") or "").lower()
+    local = (my_email.split("@",1)[0] if "@" in my_email else "me")
+
+    # 認証できた段階で <local>-token.json を保存（既存 token はそのまま）
+    token_path = Path(args.token_file)
+    pref_token = token_path.with_name(f"{local}-token.json")
+    try:
+        pref_token.write_text(creds.to_json(), encoding="utf-8")
+    except Exception:
+        pass  # 失敗しても続行
+
+    # 出力ファイル名にローカル部プレフィックスを付与
+    def prefixed(path_str: Optional[str]) -> Optional[Path]:
+        if path_str is None:
+            return None
+        p = Path(path_str)
+        name = p.name
+        if not name.startswith(f"{local}-"):
+            name = f"{local}-{name}"
+        return (p.parent or here) / name
+
+    out_threads = prefixed(args.out_threads)
+    out_msgs    = prefixed(args.messages_out) if args.messages_out else None
+
+    out_threads.parent.mkdir(parents=True, exist_ok=True)
+    if out_msgs: out_msgs.parent.mkdir(parents=True, exist_ok=True)
 
     # 1) 送信済みメッセージ→threadId を収集
     label_ids = [x.strip() for x in (args.label_ids.split(",") if args.label_ids else []) if x.strip()] or ["SENT"]
@@ -237,7 +262,7 @@ def main():
             if msg_fp:
                 msg_fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-            time.sleep(max(args.rate_sleep, 0.0))  # ← 修正済み
+            time.sleep(max(args.rate_sleep, 0.0))  # レート制御
 
         thread_obj = {
             "thread_id": tid,
