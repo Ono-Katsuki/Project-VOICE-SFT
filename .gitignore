@@ -1,0 +1,22 @@
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Secrets / Keys
+*.pem
+*.p12
+*.key
+*.secret
+*service_account*.json
+*client_secret*.json
+credentials.json
+token.json
+
+# Data outputs
+dataset/messages.jsonl
+dataset/.seen_ids.txt
+dataset/attachments/
