@@ -11,8 +11,14 @@ except ImportError:
     print("pip install google-genai が必要です", file=sys.stderr)
     sys.exit(1)
 
-MODEL_CLEAN = "gemini-2.5-pro"
-MODEL_META  = "gemini-2.5-pro"
+# --- 変更点 1: モデル名を flash に変更 ---
+MODEL_CLEAN = "gemini-2.5-flash"
+MODEL_META  = "gemini-2.5-flash"
+
+# --- 変更点 2: 思考なし設定を定義 ---
+# (辞書として直接渡すため、インポートは不要)
+NO_THINKING_CONFIG = {"thinking_config": {"thinking_budget": 0}}
+
 
 CLEAN_PROMPT = """あなたはテキストを最小限にクリーンするアシスタントです。
 以下のルールで入力テキストを「できるだけ元の言い回しを残して」書き換えてください。
@@ -67,6 +73,7 @@ def call_clean(client: genai.Client, text: str, source_kind: str) -> str:
     resp = client.models.generate_content(
         model=MODEL_CLEAN,
         contents=[prompt, text],
+        generation_config=NO_THINKING_CONFIG # --- 変更点 3: 思考なし設定を適用 ---
     )
     return (resp.text or "").strip()
 
@@ -74,6 +81,7 @@ def call_meta(client: genai.Client, cleaned_text: str) -> Dict[str, Any]:
     resp = client.models.generate_content(
         model=MODEL_META,
         contents=[META_PROMPT, cleaned_text],
+        generation_config=NO_THINKING_CONFIG # --- 変更点 4: 思考なし設定を適用 ---
     )
     raw = (resp.text or "").strip()
     try:
