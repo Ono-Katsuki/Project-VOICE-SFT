@@ -19,7 +19,6 @@ MODEL_META  = "gemini-2.5-flash"
 # (辞書として直接渡すため、インポートは不要)
 NO_THINKING_CONFIG = {"thinking_config": {"thinking_budget": 0}}
 
-
 CLEAN_PROMPT = """あなたはテキストを最小限にクリーンするアシスタントです。
 以下のルールで入力テキストを「できるだけ元の言い回しを残して」書き換えてください。
 
@@ -60,7 +59,7 @@ META_PROMPT = """あなたはクリーン済みテキストに属性をつける
 """
 
 def get_client() -> genai.Client:
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("環境変数 GOOGLE_API_KEY がありません", file=sys.stderr)
         sys.exit(1)
@@ -73,7 +72,7 @@ def call_clean(client: genai.Client, text: str, source_kind: str) -> str:
     resp = client.models.generate_content(
         model=MODEL_CLEAN,
         contents=[prompt, text],
-        generation_config=NO_THINKING_CONFIG # --- 変更点 3: 思考なし設定を適用 ---
+        config=NO_THINKING_CONFIG          # --- 変更点 3: 思考なし設定を適用 ---
     )
     return (resp.text or "").strip()
 
@@ -81,7 +80,7 @@ def call_meta(client: genai.Client, cleaned_text: str) -> Dict[str, Any]:
     resp = client.models.generate_content(
         model=MODEL_META,
         contents=[META_PROMPT, cleaned_text],
-        generation_config=NO_THINKING_CONFIG # --- 変更点 4: 思考なし設定を適用 ---
+        config=NO_THINKING_CONFIG          # --- 変更点 4: 思考なし設定を適用 ---
     )
     raw = (resp.text or "").strip()
     try:
