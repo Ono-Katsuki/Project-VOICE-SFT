@@ -255,7 +255,7 @@ def main():
 
     replaced = 0
     written_oids = set()
-
+ 
     with outp.open(encoding="utf-8") as fin, tmp_path.open("w", encoding="utf-8") as fout:
         for line in fin:
             s = line.strip()
