@@ -105,7 +105,7 @@ def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 
             meta = call_meta(shared_client, cleaned)
             return {
                 "id": rec["clean_id"],
-                "original_id": rec["original_id"],  # 文字列に正規化済み
+                "original_id": rec["original_id"],
                 "text": cleaned,
                 "clean_score": int(meta.get("clean_score", 3)),
                 "language": meta.get("language", "unknown"),
@@ -132,7 +132,7 @@ def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 
 
     return {
         "id": rec["clean_id"],
-        "original_id": rec["original_id"],  # 文字列に正規化済み
+        "original_id": rec["original_id"],
         "text": rec["text"],
         "clean_score": 5,
         "language": "unknown",
@@ -150,12 +150,6 @@ def print_progress(done: int, total: int):
     sys.stdout.flush()
     if done == total:
         sys.stdout.write("\n")
-
-# --- 型のみ汎用化のための最小ヘルパ（original_id を文字列化） ---
-def _to_id_str(x: Any) -> str:
-    if x is None:
-        return ""
-    return str(x)
 
 def main():
     import argparse
@@ -184,7 +178,7 @@ def main():
             src = json.loads(line)
             records.append({
                 "clean_id": clean_id,
-                "original_id": _to_id_str(src.get("id")),  # ★ ここだけ型汎用化（文字列正規化）
+                "original_id": src.get("id"),
                 "text": src.get("text") or "",
                 "source_kind": src.get("source_kind") or "",
             })
