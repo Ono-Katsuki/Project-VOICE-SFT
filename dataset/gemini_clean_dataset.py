@@ -159,6 +159,9 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max-workers", type=int, default=4)
     ap.add_argument("--retries", type=int, default=3, help="-1 で無限リトライ")
+    # --- 変更点 5: 既存出力から error の original_id だけを再処理するオプション ---
+    ap.add_argument("--retry-errors", action="store_true",
+                    help="既存の --output を読み、error のある original_id のみ再処理する（id維持）")
     args = ap.parse_args()
 
     # ユーザー指定を尊重して50まで許可
@@ -168,6 +171,7 @@ def main():
     outp = Path(args.output)
     outp.parent.mkdir(parents=True, exist_ok=True)
 
+    # 入力読み込み
     records: List[Dict[str,Any]] = []
     clean_id = 1
     with inp.open(encoding="utf-8") as f:
@@ -185,6 +189,33 @@ def main():
             clean_id += 1
             if args.limit and len(records) >= args.limit:
                 break
+
+    # --- 変更点 6: 出力ファイルから error の original_id を抽出してフィルタ（idは維持） ---
+    if args.retry_errors and outp.exists():
+        error_ids = set()
+        with outp.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("error"):
+                    oid = obj.get("original_id")
+                    if oid is not None:
+                        error_ids.add(oid)
+        if error_ids:
+            before = len(records)
+            records = [r for r in records if r.get("original_id") in error_ids]
+            missing = len(error_ids - set(r.get("original_id") for r in records))
+            msg = f"retry-errors: {len(error_ids)} 件検出 -> 入力側の対象 {len(records)} 件にフィルタ（id維持）"
+            if missing > 0:
+                msg += f" / 入力に見つからなかった id: {missing} 件（--limit などに注意）"
+            print(msg)
+        else:
+            print("retry-errors: 既存出力に error 行が見つかりませんでした")
 
     total = len(records)
     if total == 0:
