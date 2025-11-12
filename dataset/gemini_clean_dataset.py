@@ -16,7 +16,6 @@ MODEL_CLEAN = "gemini-2.5-flash"
 MODEL_META  = "gemini-2.5-flash"
 
 # --- 変更点 2: 思考なし設定を定義 ---
-# (辞書として直接渡すため、インポートは不要)
 NO_THINKING_CONFIG = {"thinking_config": {"thinking_budget": 0}}
 
 CLEAN_PROMPT = """あなたはテキストを最小限にクリーンするアシスタントです。
@@ -72,7 +71,7 @@ def call_clean(client: genai.Client, text: str, source_kind: str) -> str:
     resp = client.models.generate_content(
         model=MODEL_CLEAN,
         contents=[prompt, text],
-        config=NO_THINKING_CONFIG          # --- 変更点 3: 思考なし設定を適用 ---
+        config=NO_THINKING_CONFIG
     )
     return (resp.text or "").strip()
 
@@ -80,7 +79,7 @@ def call_meta(client: genai.Client, cleaned_text: str) -> Dict[str, Any]:
     resp = client.models.generate_content(
         model=MODEL_META,
         contents=[META_PROMPT, cleaned_text],
-        config=NO_THINKING_CONFIG          # --- 変更点 4: 思考なし設定を適用 ---
+        config=NO_THINKING_CONFIG
     )
     raw = (resp.text or "").strip()
     try:
@@ -113,20 +112,17 @@ def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 
             }
         except Exception as e:
             last_err = e
-            # レート系なら指数バックオフ
             if is_rate_error(e):
-                backoff = base_sleep * (2 ** min(attempt, 6))  # 上限気持ち6段
+                backoff = base_sleep * (2 ** min(attempt, 6))
                 backoff = backoff + random.uniform(0, 0.5)
                 time.sleep(backoff)
             else:
-                # 非レートエラーは指定回数で打ち切り
                 if retries == -1:
                     time.sleep(base_sleep)
                     continue
                 if attempt >= retries:
                     break
                 time.sleep(base_sleep * attempt)
-        # 通常リトライ判定
         if retries != -1 and attempt >= retries:
             break
 
@@ -159,12 +155,11 @@ def main():
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max-workers", type=int, default=4)
     ap.add_argument("--retries", type=int, default=3, help="-1 で無限リトライ")
-    # --- 変更点 5: 既存出力から error の original_id だけを再処理するオプション ---
+    # --- 追加: エラー行の original_id を再処理し、同じ original_id の行を上書き保存 ---
     ap.add_argument("--retry-errors", action="store_true",
-                    help="既存の --output を読み、error のある original_id のみ再処理する（id維持）")
+                    help="既存の --output を読み、error のある original_id のみ再処理してファイル内のエラー行を上書き保存（id維持）")
     args = ap.parse_args()
 
-    # ユーザー指定を尊重して50まで許可
     max_workers = min(args.max_workers, 50)
 
     inp = Path(args.input)
@@ -190,9 +185,9 @@ def main():
             if args.limit and len(records) >= args.limit:
                 break
 
-    # --- 変更点 6: 出力ファイルから error の original_id を抽出してフィルタ（idは維持） ---
+    # 既存出力から error の original_id を抽出（idは維持）
+    retry_ids = set()
     if args.retry_errors and outp.exists():
-        error_ids = set()
         with outp.open(encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -205,12 +200,11 @@ def main():
                 if obj.get("error"):
                     oid = obj.get("original_id")
                     if oid is not None:
-                        error_ids.add(oid)
-        if error_ids:
-            before = len(records)
-            records = [r for r in records if r.get("original_id") in error_ids]
-            missing = len(error_ids - set(r.get("original_id") for r in records))
-            msg = f"retry-errors: {len(error_ids)} 件検出 -> 入力側の対象 {len(records)} 件にフィルタ（id維持）"
+                        retry_ids.add(oid)
+        if retry_ids:
+            records = [r for r in records if r.get("original_id") in retry_ids]
+            missing = len(retry_ids - set(r.get("original_id") for r in records))
+            msg = f"retry-errors: {len(retry_ids)} 件検出 -> 入力側の対象 {len(records)} 件にフィルタ（id維持）"
             if missing > 0:
                 msg += f" / 入力に見つからなかった id: {missing} 件（--limit などに注意）"
             print(msg)
@@ -222,29 +216,77 @@ def main():
         print("no records.")
         return
 
-    outf = outp.open("a", encoding="utf-8")
-    lock = threading.Lock()
-
     client = get_client()
 
     done_count = 0
     print_progress(done_count, total)
 
+    lock = threading.Lock()
+    new_results: List[Dict[str,Any]] = []
+
+    # retry-errors のときはメモリに結果を溜めて後で置換。通常は追記。
+    append_mode = not args.retry_errors
+    outf = None
+    if append_mode:
+        outf = outp.open("a", encoding="utf-8")
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [
-            ex.submit(process_one, client, rec, args.retries)
-            for rec in records
-        ]
+        futures = [ex.submit(process_one, client, rec, args.retries) for rec in records]
         for fut in as_completed(futures):
             result = fut.result()
             with lock:
-                outf.write(json.dumps(result, ensure_ascii=False) + "\n")
-                outf.flush()
+                if append_mode:
+                    outf.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    outf.flush()
+                else:
+                    new_results.append(result)
             done_count += 1
             print_progress(done_count, total)
 
-    outf.close()
-    print(f"done -> {outp} ({total} records)")
+    if append_mode:
+        outf.close()
+        print(f"done -> {outp} ({total} records)")
+        return
+
+    # ---- 上書き保存（retry-errors）----
+    # エラー行のみを対象に、同じ original_id の行を新しい結果で置換する
+    new_by_oid: Dict[Any, Dict[str,Any]] = {r["original_id"]: r for r in new_results if "original_id" in r}
+    tmp_path = outp.with_suffix(outp.suffix + ".tmp")
+
+    replaced = 0
+    written_oids = set()
+
+    with outp.open(encoding="utf-8") as fin, tmp_path.open("w", encoding="utf-8") as fout:
+        for line in fin:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                # 壊れた行はそのまま残す
+                fout.write(line)
+                continue
+            oid = obj.get("original_id")
+            # --- 最小修正: エラー行のみ置換し、同一 original_id の複数エラー行も全て置換 ---
+            if obj.get("error") and oid in retry_ids and oid in new_by_oid:
+                fout.write(json.dumps(new_by_oid[oid], ensure_ascii=False) + "\n")
+                written_oids.add(oid)
+                replaced += 1
+                # del しない：同じ original_id の後続エラー行も置換するため保持
+            else:
+                fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+        # 出力に存在しなかった original_id（まれ）を末尾追記
+        for oid, obj in new_by_oid.items():
+            if oid not in written_oids:
+                fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    import os as _os
+    _os.replace(tmp_path, outp)
+
+    print(f"replaced {replaced} error rows in {outp}")
+    print(f"done -> {outp} ({total} retried records)")
 
 if __name__ == "__main__":
     main()
