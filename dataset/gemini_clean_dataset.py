@@ -185,9 +185,16 @@ def main():
             if args.limit and len(records) >= args.limit:
                 break
 
-    # 既存出力から error の original_id を抽出（idは維持）
+    # 既存出力から error の original_id を抽出（idは維持）＋ 既存 id マップ構築
     retry_ids = set()
+    id_by_oid: Dict[Any, int] = {}    # original_id -> id（既存の id を保持）
+    present_oids = set()              # メイン出力に存在する original_id
+    max_existing_id = 0
+
+    err_path = outp.with_suffix(outp.suffix + ".errors.jsonl")
+
     if args.retry_errors and outp.exists():
+        # メイン出力の走査（エラー行は今後書かれない想定だが、互換のため両方見る）
         with outp.open(encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -197,19 +204,50 @@ def main():
                     obj = json.loads(line)
                 except Exception:
                     continue
-                if obj.get("error"):
-                    oid = obj.get("original_id")
-                    if oid is not None:
-                        retry_ids.add(oid)
+                oid2 = obj.get("original_id")
+                cid2 = obj.get("id")
+                if oid2 is not None:
+                    present_oids.add(oid2)
+                if isinstance(cid2, int) and cid2 > max_existing_id:
+                    max_existing_id = cid2
+                # 既存の id を確定（先勝ち）
+                if oid2 is not None and cid2 is not None and oid2 not in id_by_oid:
+                    id_by_oid[oid2] = cid2
+                # 互換: メインに残っている error 行があれば収集
+                if obj.get("error") and oid2 is not None:
+                    retry_ids.add(oid2)
+
+        # エラーファイルがあれば、そちらからも retry 対象を収集
+        if err_path.exists():
+            with err_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("error"):
+                        oid = obj.get("original_id")
+                        if oid is not None:
+                            retry_ids.add(oid)
+
         if retry_ids:
+            # 入力側を再試行対象に絞る
             records = [r for r in records if r.get("original_id") in retry_ids]
+            # 再処理レコードに既存 id を引き継ぐ（id維持）
+            for r in records:
+                oid = r["original_id"]
+                if oid in id_by_oid:
+                    r["clean_id"] = id_by_oid[oid]
             missing = len(retry_ids - set(r.get("original_id") for r in records))
             msg = f"retry-errors: {len(retry_ids)} 件検出 -> 入力側の対象 {len(records)} 件にフィルタ（id維持）"
             if missing > 0:
                 msg += f" / 入力に見つからなかった id: {missing} 件（--limit などに注意）"
             print(msg)
         else:
-            print("retry-errors: 既存出力に error 行が見つかりませんでした")
+            print("retry-errors: 既存出力・エラーファイルに error 行が見つかりませんでした")
 
     total = len(records)
     if total == 0:
@@ -227,8 +265,12 @@ def main():
     # retry-errors のときはメモリに結果を溜めて後で置換。通常は追記。
     append_mode = not args.retry_errors
     outf = None
+    errf = None
     if append_mode:
         outf = outp.open("a", encoding="utf-8")
+        # エラーはメインに書かず、別ファイルにのみ書く（必要な場合の再試行に備える）
+        errf = err_path.open("a", encoding="utf-8")
+    skipped_errors = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(process_one, client, rec, args.retries) for rec in records]
@@ -236,26 +278,37 @@ def main():
             result = fut.result()
             with lock:
                 if append_mode:
-                    outf.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    outf.flush()
+                    # エラーはメイン出力に一切書かない
+                    if result.get("error"):
+                        if errf:
+                            errf.write(json.dumps(result, ensure_ascii=False) + "\n")
+                            errf.flush()
+                        skipped_errors += 1
+                    else:
+                        outf.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        outf.flush()
                 else:
                     new_results.append(result)
             done_count += 1
             print_progress(done_count, total)
 
     if append_mode:
-        outf.close()
-        print(f"done -> {outp} ({total} records)")
+        if outf: outf.close()
+        if errf: errf.close()
+        print(f"done -> {outp} (written {total - skipped_errors}, skipped errors {skipped_errors} -> {err_path})")
         return
 
     # ---- 上書き保存（retry-errors）----
-    # エラー行のみを対象に、同じ original_id の行を新しい結果で置換する
-    new_by_oid: Dict[Any, Dict[str,Any]] = {r["original_id"]: r for r in new_results if "original_id" in r}
+    # 成功した再処理結果のみ置換候補（error を含むものは捨てる）
+    new_by_oid: Dict[Any, Dict[str,Any]] = {
+        r["original_id"]: r for r in new_results
+        if "original_id" in r and not r.get("error")
+    }
     tmp_path = outp.with_suffix(outp.suffix + ".tmp")
 
     replaced = 0
     written_oids = set()
- 
+
     with outp.open(encoding="utf-8") as fin, tmp_path.open("w", encoding="utf-8") as fout:
         for line in fin:
             s = line.strip()
@@ -268,25 +321,34 @@ def main():
                 fout.write(line)
                 continue
             oid = obj.get("original_id")
-            # --- 最小修正: エラー行のみ置換し、同一 original_id の複数エラー行も全て置換 ---
+            # エラー行のみ置換（成功再処理がある場合のみ）。id は旧値を維持
             if obj.get("error") and oid in retry_ids and oid in new_by_oid:
-                fout.write(json.dumps(new_by_oid[oid], ensure_ascii=False) + "\n")
+                new_obj = dict(new_by_oid[oid])
+                if "id" in obj:
+                    new_obj["id"] = obj["id"]  # ★ 旧 id を維持
+                fout.write(json.dumps(new_obj, ensure_ascii=False) + "\n")
                 written_oids.add(oid)
                 replaced += 1
-                # del しない：同じ original_id の後続エラー行も置換するため保持
             else:
                 fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-        # 出力に存在しなかった original_id（まれ）を末尾追記
+        # 出力（メイン）に存在しなかった original_id を末尾追記（成功結果のみ）
+        # 既存 id があれば維持、なければ最大 id の続きで採番
         for oid, obj in new_by_oid.items():
-            if oid not in written_oids:
-                fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            if oid not in present_oids and oid not in written_oids:
+                new_obj = dict(obj)
+                if oid in id_by_oid:
+                    new_obj["id"] = id_by_oid[oid]
+                else:
+                    max_existing_id += 1
+                    new_obj["id"] = max_existing_id
+                fout.write(json.dumps(new_obj, ensure_ascii=False) + "\n")
 
     import os as _os
     _os.replace(tmp_path, outp)
 
     print(f"replaced {replaced} error rows in {outp}")
-    print(f"done -> {outp} ({total} retried records)")
+    print(f"done -> {outp} ({len(new_results)} retried records; successful {len(new_by_oid)}, failed {len(new_results) - len(new_by_oid)})")
 
 if __name__ == "__main__":
     main()
