@@ -94,19 +94,23 @@ def is_rate_error(e: Exception) -> bool:
 
 def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 3, base_sleep: float = 0.5) -> Dict[str,Any]:
     """
-    retries:
-      - >0 : 最大リトライ回数
-      -  0 : リトライしない
-      - -1 : レートエラーのみ無限リトライ。非レートエラーは1回で諦める。
+    retries == -1 の場合は無限リトライ
     """
     attempt = 0
     last_err = None
+
+    # --- DEBUG ---
+    print(f"[DEBUG] process_one START original_id={rec.get('original_id')} clean_id={rec.get('clean_id')}", file=sys.stderr)
 
     while True:
         attempt += 1
         try:
             cleaned = call_clean(shared_client, rec["text"], rec.get("source_kind") or "")
             meta = call_meta(shared_client, cleaned)
+
+            # --- DEBUG ---
+            print(f"[DEBUG] process_one SUCCESS original_id={rec.get('original_id')} attempt={attempt}", file=sys.stderr)
+
             return {
                 "id": rec["clean_id"],
                 "original_id": rec["original_id"],
@@ -117,34 +121,39 @@ def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 
             }
         except Exception as e:
             last_err = e
+            is_rate = is_rate_error(e)
 
-            # レート系エラー (429/503など) の場合
-            if is_rate_error(e):
-                # retries == -1 のときは無限リトライ
-                if retries != -1 and attempt > retries:
-                    break
+            # --- DEBUG ---
+            print(
+                f"[DEBUG] process_one EXCEPTION original_id={rec.get('original_id')} "
+                f"attempt={attempt} is_rate_error={is_rate} error={e}",
+                file=sys.stderr
+            )
+
+            # レート系なら指数バックオフ
+            if is_rate:
                 backoff = base_sleep * (2 ** min(attempt, 6))  # 上限気持ち6段
                 backoff = backoff + random.uniform(0, 0.5)
                 time.sleep(backoff)
-                continue
+            else:
+                # 非レートエラーは指定回数で打ち切り
+                if retries == -1:
+                    time.sleep(base_sleep)
+                    continue
+                if attempt >= retries:
+                    break
+                time.sleep(base_sleep * attempt)
+        # 通常リトライ判定
+        if retries != -1 and attempt >= retries:
+            break
 
-            # それ以外のエラー（バリデーションエラーなど）は、
-            # retries > 0 のときだけその回数までリトライ。retries == -1 は「無限」にはしない。
-            if retries == -1:
-                # 非レートエラーで -1 のときは即諦める
-                break
-
-            if attempt >= retries:
-                break
-
-            time.sleep(base_sleep * attempt)
-            continue
-
-    # ここまで来たらリトライしきっても成功しなかった
+    # エラー内容はデータに保存せず、stderr にだけ出す
     if last_err is not None:
         print(f"[ERROR] clean failed for original_id={rec.get('original_id')}: {last_err}", file=sys.stderr)
 
-    # エラー内容はデータには保存しない（元テキスト + 高リスクスコア扱い）
+    # --- DEBUG ---
+    print(f"[DEBUG] process_one FALLBACK original_id={rec.get('original_id')}", file=sys.stderr)
+
     return {
         "id": rec["clean_id"],
         "original_id": rec["original_id"],
@@ -172,7 +181,7 @@ def main():
     ap.add_argument("--output", default="dataset/cleaned.jsonl")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max-workers", type=int, default=4)
-    ap.add_argument("--retries", type=int, default=3, help="-1 でレートエラーのみ無限リトライ")
+    ap.add_argument("--retries", type=int, default=3, help="-1 で無限リトライ")
     args = ap.parse_args()
 
     # ユーザー指定を尊重して50まで許可
@@ -185,6 +194,7 @@ def main():
     # --- 既存 cleaned.jsonl から処理済み original_id と最大 clean_id を読む ---
     processed_original_ids = set()
     max_existing_clean_id = 0
+    existing_lines = 0
 
     if outp.exists():
         with outp.open(encoding="utf-8") as f:
@@ -192,6 +202,7 @@ def main():
                 line = line.strip()
                 if not line:
                     continue
+                existing_lines += 1
                 try:
                     obj = json.loads(line)
                 except Exception:
@@ -203,15 +214,25 @@ def main():
                 if isinstance(cid, int) and cid > max_existing_clean_id:
                     max_existing_clean_id = cid
 
+    # --- DEBUG ---
+    print(
+        f"[DEBUG] existing cleaned.jsonl lines={existing_lines} "
+        f"unique_processed_original_ids={len(processed_original_ids)} "
+        f"max_existing_clean_id={max_existing_clean_id}",
+        file=sys.stderr
+    )
+
     records: List[Dict[str,Any]] = []
     # 既存の最大 id の続きから clean_id を振る
     clean_id = max_existing_clean_id + 1 if max_existing_clean_id > 0 else 1
 
+    total_input_lines = 0
     with inp.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            total_input_lines += 1
             src = json.loads(line)
             original_id = src.get("id")
 
@@ -230,6 +251,16 @@ def main():
                 break
 
     total = len(records)
+
+    # --- DEBUG ---
+    first_ids = [r.get("original_id") for r in records[:5]]
+    print(
+        f"[DEBUG] input total_lines={total_input_lines} "
+        f"new_records_to_process={total} "
+        f"sample_original_ids={first_ids}",
+        file=sys.stderr
+    )
+
     if total == 0:
         # 既に全部処理済みのケースも含む
         print("no new records.")
@@ -248,12 +279,21 @@ def main():
             ex.submit(process_one, client, rec, args.retries)
             for rec in records
         ]
+
+        # --- DEBUG ---
+        print(f"[DEBUG] submitted {len(futures)} futures with max_workers={max_workers}", file=sys.stderr)
+
         for fut in as_completed(futures):
             result = fut.result()
             with lock:
                 outf.write(json.dumps(result, ensure_ascii=False) + "\n")
                 outf.flush()
             done_count += 1
+
+            # --- DEBUG ---
+            if done_count <= 5 or done_count % 1000 == 0:
+                print(f"[DEBUG] progress done_count={done_count}/{total}", file=sys.stderr)
+
             print_progress(done_count, total)
 
     outf.close()
