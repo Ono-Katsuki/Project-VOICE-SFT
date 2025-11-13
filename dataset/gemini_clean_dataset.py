@@ -130,6 +130,10 @@ def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 
         if retries != -1 and attempt >= retries:
             break
 
+    # エラー内容はデータに保存せず、stderr にだけ出す
+    if last_err is not None:
+        print(f"[ERROR] clean failed for original_id={rec.get('original_id')}: {last_err}", file=sys.stderr)
+
     return {
         "id": rec["clean_id"],
         "original_id": rec["original_id"],
@@ -137,7 +141,6 @@ def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 
         "clean_score": 5,
         "language": "unknown",
         "genre": "その他",
-        "error": str(last_err) if last_err else "unknown error"
     }
 
 def print_progress(done: int, total: int):
@@ -168,17 +171,46 @@ def main():
     outp = Path(args.output)
     outp.parent.mkdir(parents=True, exist_ok=True)
 
+    # --- 追加: 既存 cleaned.jsonl から処理済み original_id と最大 clean_id を読む ---
+    processed_original_ids = set()
+    max_existing_clean_id = 0
+
+    if outp.exists():
+        with outp.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                oid = obj.get("original_id")
+                if oid is not None:
+                    processed_original_ids.add(oid)
+                cid = obj.get("id")
+                if isinstance(cid, int) and cid > max_existing_clean_id:
+                    max_existing_clean_id = cid
+
     records: List[Dict[str,Any]] = []
-    clean_id = 1
+    # 既存の最大 id の続きから clean_id を振る
+    clean_id = max_existing_clean_id + 1 if max_existing_clean_id > 0 else 1
+
     with inp.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             src = json.loads(line)
+            original_id = src.get("id")
+
+            # 既に cleaned.jsonl にある original_id はスキップ
+            if original_id in processed_original_ids:
+                continue
+
             records.append({
                 "clean_id": clean_id,
-                "original_id": src.get("id"),
+                "original_id": original_id,
                 "text": src.get("text") or "",
                 "source_kind": src.get("source_kind") or "",
             })
@@ -188,7 +220,8 @@ def main():
 
     total = len(records)
     if total == 0:
-        print("no records.")
+        # 既に全部処理済みのケースも含む
+        print("no new records.")
         return
 
     outf = outp.open("a", encoding="utf-8")
@@ -196,7 +229,7 @@ def main():
 
     client = get_client()
 
-    done_count = 0
+    done_count = 0    # 今回新たに処理する件数の進捗
     print_progress(done_count, total)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
