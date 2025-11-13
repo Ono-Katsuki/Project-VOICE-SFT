@@ -94,10 +94,14 @@ def is_rate_error(e: Exception) -> bool:
 
 def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 3, base_sleep: float = 0.5) -> Dict[str,Any]:
     """
-    retries == -1 の場合は無限リトライ
+    retries:
+      - >0 : 最大リトライ回数
+      -  0 : リトライしない
+      - -1 : レートエラーのみ無限リトライ。非レートエラーは1回で諦める。
     """
     attempt = 0
     last_err = None
+
     while True:
         attempt += 1
         try:
@@ -113,27 +117,34 @@ def process_one(shared_client: genai.Client, rec: Dict[str,Any], retries: int = 
             }
         except Exception as e:
             last_err = e
-            # レート系なら指数バックオフ
+
+            # レート系エラー (429/503など) の場合
             if is_rate_error(e):
+                # retries == -1 のときは無限リトライ
+                if retries != -1 and attempt > retries:
+                    break
                 backoff = base_sleep * (2 ** min(attempt, 6))  # 上限気持ち6段
                 backoff = backoff + random.uniform(0, 0.5)
                 time.sleep(backoff)
-            else:
-                # 非レートエラーは指定回数で打ち切り
-                if retries == -1:
-                    time.sleep(base_sleep)
-                    continue
-                if attempt >= retries:
-                    break
-                time.sleep(base_sleep * attempt)
-        # 通常リトライ判定
-        if retries != -1 and attempt >= retries:
-            break
+                continue
 
-    # エラー内容はデータに保存せず、stderr にだけ出す
+            # それ以外のエラー（バリデーションエラーなど）は、
+            # retries > 0 のときだけその回数までリトライ。retries == -1 は「無限」にはしない。
+            if retries == -1:
+                # 非レートエラーで -1 のときは即諦める
+                break
+
+            if attempt >= retries:
+                break
+
+            time.sleep(base_sleep * attempt)
+            continue
+
+    # ここまで来たらリトライしきっても成功しなかった
     if last_err is not None:
         print(f"[ERROR] clean failed for original_id={rec.get('original_id')}: {last_err}", file=sys.stderr)
 
+    # エラー内容はデータには保存しない（元テキスト + 高リスクスコア扱い）
     return {
         "id": rec["clean_id"],
         "original_id": rec["original_id"],
@@ -161,7 +172,7 @@ def main():
     ap.add_argument("--output", default="dataset/cleaned.jsonl")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max-workers", type=int, default=4)
-    ap.add_argument("--retries", type=int, default=3, help="-1 で無限リトライ")
+    ap.add_argument("--retries", type=int, default=3, help="-1 でレートエラーのみ無限リトライ")
     args = ap.parse_args()
 
     # ユーザー指定を尊重して50まで許可
@@ -171,7 +182,7 @@ def main():
     outp = Path(args.output)
     outp.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- 追加: 既存 cleaned.jsonl から処理済み original_id と最大 clean_id を読む ---
+    # --- 既存 cleaned.jsonl から処理済み original_id と最大 clean_id を読む ---
     processed_original_ids = set()
     max_existing_clean_id = 0
 
