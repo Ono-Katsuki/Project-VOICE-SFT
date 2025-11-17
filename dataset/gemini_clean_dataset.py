@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, json, sys, time, threading, random
+import os, json, sys, time, threading, random, re
 from pathlib import Path
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,7 +38,16 @@ CLEAN_PROMPT = """あなたはテキストを最小限にクリーンするア�
 【重要】
 - 元の文体・語順はできるだけ保つ
 - 不明なものを一律にマスクしない
-- 出力はクリーン後のテキストのみ
+
+【出力フォーマット】
+- クリーン後のテキストのみを <CLEAN> と </CLEAN> の間に出力してください。
+- 例:
+
+<CLEAN>
+(ここにクリーン後テキスト)
+</CLEAN>
+
+- <CLEAN> タグの外側には何も出力しないでください。
 """
 
 META_PROMPT = """あなたはクリーン済みテキストに属性をつけるアシスタントです。
@@ -54,8 +63,18 @@ META_PROMPT = """あなたはクリーン済みテキストに属性をつける
 【language】主要言語
 【genre】["メール","メッセージ","メモ","プログラム","仕様","その他"] のいずれか
 
-例:
+例（JSON 部分の例）:
 {"clean_score": 2, "language": "日本語", "genre": "メール"}
+
+【出力フォーマット】
+- 上記の JSON を1行だけ <META> と </META> の間に出力してください。
+- 例:
+
+<META>
+{"clean_score": 2, "language": "日本語", "genre": "メール"}
+</META>
+
+- <META> タグの外側には何も出力しないでください。
 """
 
 def get_client() -> genai.Client:
@@ -67,14 +86,20 @@ def get_client() -> genai.Client:
 
 def call_clean(client: genai.Client, text: str, source_kind: str) -> str:
     prompt = CLEAN_PROMPT
-    if source_kind in ("gmail","threads_full","email","mail"):
+    if source_kind in ("gmail", "threads_full", "email", "mail"):
         prompt += "\nこのテキストはメール由来です。\n"
     resp = client.models.generate_content(
         model=MODEL_CLEAN,
         contents=[prompt, text],
         config=NO_THINKING_CONFIG          # --- 変更点 3: 思考なし設定を適用 ---
     )
-    return (resp.text or "").strip()
+    full = (resp.text or "").strip()
+
+    # <CLEAN> ... </CLEAN> 内だけ取り出す（失敗したら全体を使う）
+    m = re.search(r"<CLEAN>\s*(.*?)\s*</CLEAN>", full, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return full
 
 def call_meta(client: genai.Client, cleaned_text: str) -> Dict[str, Any]:
     resp = client.models.generate_content(
@@ -82,7 +107,16 @@ def call_meta(client: genai.Client, cleaned_text: str) -> Dict[str, Any]:
         contents=[META_PROMPT, cleaned_text],
         config=NO_THINKING_CONFIG          # --- 変更点 4: 思考なし設定を適用 ---
     )
-    raw = (resp.text or "").strip()
+    full = (resp.text or "").strip()
+
+    # <META> ... </META> 内の { ... } を抜き出す
+    m = re.search(r"<META>\s*(\{.*?\})\s*</META>", full, re.DOTALL | re.IGNORECASE)
+    if m:
+        raw = m.group(1).strip()
+    else:
+        # タグが無い場合は従来通り全部を JSON とみなしてパースを試みる
+        raw = full
+
     try:
         return json.loads(raw)
     except Exception:
