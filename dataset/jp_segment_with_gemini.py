@@ -111,9 +111,13 @@ def _parse_segment_response(full: str) -> Tuple[bool, str, str, str]:
 def _normalize_for_compare(s: str) -> str:
     """
     原文一致チェック用の軽い正規化。
-    必要に応じて CRLF→LF などをここに追加してもよい。
-    今回は「完全一致」を狙うのでそのまま返す。
+
+    - CRLF/CR を LF に統一
+    - 改行文字は比較時には無視する
+      （＝改行位置だけの違いなら OK とみなす）
     """
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\n", "")
     return s
 
 
@@ -228,7 +232,7 @@ def call_segment(client: genai.Client, text: str) -> Dict[str, str]:
     Gemini に分割＆よみをやらせる。
     - JSON フォーマット
     - surface/yomi トークン数一致
-    - surface の連結で原文一致
+    - surface の連結で原文一致（改行は無視）
     をチェックし、
     まずプログラム側で自動補正を試す。
     それでも NG の場合だけプロンプトにフィードバックを足して再トライする。
