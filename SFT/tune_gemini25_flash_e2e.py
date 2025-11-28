@@ -19,14 +19,14 @@ from vertexai.tuning import sft
 # ========= 設定ここから =========
 
 # GCP プロジェクト
-PROJECT_ID = "your-project-id"
+PROJECT_ID = "project-voice-476504"
 
 # チューニング対応リージョン（公式サンプルと同じく us-central1 を例に）
 # ※必要なら gemini supervised tuning の「Supported regions」ドキュメントに合わせて変更
 LOCATION = "us-central1"
 
 # 既存の GCS バケット名
-BUCKET_NAME = "your-tuning-bucket"
+BUCKET_NAME = "project-voice-models"
 
 # GCS 上での保存プレフィックス
 GCS_PREFIX = "gemini25_sft/run1"
@@ -39,7 +39,7 @@ LOCAL_VALID_FILE = ""                         # 検証を使うならパス、�
 SOURCE_MODEL = "gemini-2.5-flash"
 
 # チューニング済みモデルの表示名
-TUNED_MODEL_DISPLAY_NAME = "my-gemini25-flash-sft"
+TUNED_MODEL_DISPLAY_NAME = "voice-v1"
 
 # ハイパーパラメータ（全部 None なら「自動」におまかせ）
 # いじりたくなったらコメントアウト外す
