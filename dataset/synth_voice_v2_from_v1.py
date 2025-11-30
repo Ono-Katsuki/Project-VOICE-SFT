@@ -33,7 +33,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 
 import vertexai
-from vertexai.generative_models import GenerativeModel, GenerationConfig
+from vertexai.generative_models import (
+    GenerativeModel,
+    GenerationConfig,
+    ThinkingConfig,  # ★ 追加
+)
 
 
 # ========= デフォルト設定ここから =========
@@ -69,10 +73,13 @@ MAX_WORKERS_DEFAULT = 4
 # モデル呼び出しの最大リトライ回数（-1 で無限リトライ）
 MAX_MODEL_RETRIES_DEFAULT = -1
 
+# ★ thinking_config 経由で thinking_budget=0（思考オフ）を指定
 GEN_CONFIG_DEFAULT = GenerationConfig(
     temperature=0.2,
     max_output_tokens=64,
-    thinking_budget=0,
+    thinking_config=ThinkingConfig(
+        thinking_budget=0,
+    ),
 )
 
 # v2 学習時の固定プロンプト
@@ -165,7 +172,7 @@ def build_full_input(seed_text: str, context_prompt: str) -> str:
     - 文脈プロンプト
     - シード（v1 の input_text）
     """
-    return f"{FIXED_PROMPT}\n{context_prompt}\n{seed_text}"
+    return f"{context_prompt}\n{FIXED_PROMPT}\n{seed_text}"
 
 
 # --- モデル呼び出し（リトライ付き） -------------------------------------------
