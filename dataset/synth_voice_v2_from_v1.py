@@ -67,12 +67,12 @@ OUT_GEMINI_JSONL_DEFAULT = (
 MAX_WORKERS_DEFAULT = 4
 
 # モデル呼び出しの最大リトライ回数（-1 で無限リトライ）
-MAX_MODEL_RETRIES_DEFAULT = 3
+MAX_MODEL_RETRIES_DEFAULT = -1
 
-# 生成設定（思考オフは tuned モデル側で thinking_budget=0 済み想定）
 GEN_CONFIG_DEFAULT = GenerationConfig(
     temperature=0.2,
     max_output_tokens=64,
+    thinking_budget=0,
 )
 
 # v2 学習時の固定プロンプト
