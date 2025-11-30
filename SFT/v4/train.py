@@ -22,7 +22,7 @@ LOCATION = "us-central1"
 BUCKET_NAME = "project-voice-models"
 GCS_PREFIX = "gemini25_sft/run4"
 
-LOCAL_TRAIN_FILE = "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v4/gemini_sft_yomi2surface_train_mixed_with_context_10k_with_prompt_gemini_format.jsonl"
+LOCAL_TRAIN_FILE = "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v4/merged_yomi_candidates_gemini_sft_pruned_listprompt.jsonl"
 LOCAL_VALID_FILE = ""
 
 SOURCE_MODEL = "gemini-2.5-flash"
