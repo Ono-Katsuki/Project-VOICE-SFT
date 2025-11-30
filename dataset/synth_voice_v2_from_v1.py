@@ -20,6 +20,10 @@ v2 チューニング済みモデル (voice-v2) で予測変換データを合�
         既存の Bison 出力の (seed_id, context_id) を見てスキップ
     - 固定プロンプト + 4 文脈プロンプト + シードを user 入力に含める
     - Gemini 2.5 Flash 系チューニングモデルを thinking_budget=0（思考オフ）で呼び出し
+
+- 注意:
+    - モデル呼び出しに失敗した (seed_id, context_id) の組は
+      Bison / Gemini どちらの出力ファイルにも一切書き出さない。
 """
 
 import sys
@@ -43,11 +47,10 @@ from google.genai.types import GenerateContentConfig, ThinkingConfig
 PROJECT_ID_DEFAULT = "project-voice-476504"
 LOCATION_DEFAULT = "us-central1"
 
-# ★ v2 tuned model の「エンドポイント名」を入れる
-#   Vertex AI Studio の「エンドポイント」欄に出ている:
-#   projects/{project}/locations/{location}/endpoints/{endpoint_id}
+# ★ v2 tuned model の「エンドポイント名」
+# projects/{project}/locations/{location}/endpoints/{endpoint_id}
 TUNED_MODEL_ENDPOINT_DEFAULT = (
-    "projects/700129023625/locations/us-central1/endpoints/REPLACE_ME"
+    "projects/700129023625/locations/us-central1/endpoints/2920424929163739136"
 )
 
 # v1 の Bison 形式 JSONL (input_text / output_text)
@@ -69,7 +72,7 @@ OUT_GEMINI_JSONL_DEFAULT = (
 # 並列実行数
 MAX_WORKERS_DEFAULT = 4
 
-# モデル呼び出しの最大リトライ回数（-1 で無限リトライ *だがレート系のみ無限リトライ*）
+# モデル呼び出しの最大リトライ回数（-1 でレート制限系のみ無限リトライ）
 MAX_MODEL_RETRIES_DEFAULT = -1
 
 # thinking_config で thinking_budget=0（思考オフ）を指定
@@ -255,19 +258,9 @@ def process_one(
 ) -> Dict[str, Any]:
     """
     1 (seed_id, seed, context) の組を処理。
-    成功時:
-        {
-          "seed_id": int,
-          "seed": str,
-          "context_id": str,
-          "context_prompt": str,
-          "input_text": str,
-          "output_text": str,
-          "status": "ok",
-        }
-    失敗時:
-        - status="fallback_error"
-        - output_text は seed をそのまま入れる
+
+    成功時: status="ok" でフル情報を返す。
+    失敗時: status="error" のみ返し、出力ファイルには一切書き込まない（呼び出し側でスキップ）。
     """
     seed_id = rec["seed_id"]
     seed = rec["seed"]
@@ -284,8 +277,12 @@ def process_one(
             f"[ERROR] giving up on seed_id={seed_id}, ctx={ctx_id}: {e}",
             file=sys.stderr,
         )
-        out_text = seed
-        status = "fallback_error"
+        # ★ エラー時は seed も含め、一切書き出さない方針なので minimum 情報のみ返す
+        return {
+            "status": "error",
+            "seed_id": seed_id,
+            "context_id": ctx_id,
+        }
 
     return {
         "seed_id": seed_id,
@@ -425,6 +422,12 @@ def main() -> None:
 
         for fut in as_completed(futures):
             result = fut.result()
+
+            # ★ 失敗したレコードは出力ファイルに書かない
+            if result.get("status") != "ok":
+                done_count += 1
+                print_progress(done_count, total)
+                continue
 
             # Bison 形式
             bison_line = {
