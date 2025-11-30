@@ -19,6 +19,7 @@ v2 チューニング済みモデル (voice-v2) で予測変換データを合�
     - 途中再開:
         既存の Bison 出力の (seed_id, context_id) を見てスキップ
     - 固定プロンプト + 4 文脈プロンプト + シードを user 入力に含める
+    - Gemini 2.5 Flash 系の thinking_budget を 0（思考オフ）で固定
 """
 
 import sys
@@ -32,12 +33,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import argparse
 
-import vertexai
-from vertexai.generative_models import (
-    GenerativeModel,
-    GenerationConfig,
-    ThinkingConfig,  # ★ 追加
-)
+from google import genai
+from google.genai.types import GenerateContentConfig, ThinkingConfig
 
 
 # ========= デフォルト設定ここから =========
@@ -46,7 +43,8 @@ from vertexai.generative_models import (
 PROJECT_ID_DEFAULT = "project-voice-476504"
 LOCATION_DEFAULT = "us-central1"
 
-# ★ v2 tuned model の tuned_model_name（models/...）をそのまま入れる
+# v2 tuned model のモデル名（tuning_job.tuned_model.model と同じ形式を想定）
+# 例: projects/.../locations/us-central1/models/1234567890@1
 TUNED_MODEL_NAME_DEFAULT = (
     "projects/700129023625/locations/us-central1/models/7012041947653079040@1"
 )
@@ -73,12 +71,12 @@ MAX_WORKERS_DEFAULT = 4
 # モデル呼び出しの最大リトライ回数（-1 で無限リトライ）
 MAX_MODEL_RETRIES_DEFAULT = -1
 
-# ★ thinking_config 経由で thinking_budget=0（思考オフ）を指定
-GEN_CONFIG_DEFAULT = GenerationConfig(
+# thinking_config で thinking_budget=0（思考オフ）を指定
+GEN_CONFIG_DEFAULT = GenerateContentConfig(
     temperature=0.2,
     max_output_tokens=64,
     thinking_config=ThinkingConfig(
-        thinking_budget=0,
+        thinking_budget=0,  # 0 で思考無効（Gemini 2.5 Flash 系仕様）
     ),
 )
 
@@ -168,24 +166,25 @@ def load_processed_pairs(path: Path) -> Set[Tuple[int, str]]:
 def build_full_input(seed_text: str, context_prompt: str) -> str:
     """
     学習時の設定に合わせて user 入力を構成。
-    - 固定プロンプト
     - 文脈プロンプト
+    - 固定プロンプト
     - シード（v1 の input_text）
     """
     return f"{context_prompt}\n{FIXED_PROMPT}\n{seed_text}"
 
 
-# --- モデル呼び出し（リトライ付き） -------------------------------------------
+# --- モデル呼び出し（リトライ付き, google-genai） ---------------------------
 
 
 def call_model(
-    model: GenerativeModel,
+    client: genai.Client,
+    model_name: str,
     full_input: str,
     retries: int,
     base_sleep: float = 0.5,
 ) -> str:
     """
-    GenerativeModel でテキスト生成。
+    google-genai Client でテキスト生成。
     - retries == -1 で無限リトライ
     - レート制限系は指数バックオフ
     """
@@ -195,7 +194,11 @@ def call_model(
     while True:
         attempt += 1
         try:
-            resp = model.generate_content(full_input)
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=full_input,
+                config=GEN_CONFIG_DEFAULT,
+            )
             text = (resp.text or "").strip()
             if not text:
                 raise RuntimeError("Model returned empty text.")
@@ -231,7 +234,8 @@ def call_model(
 
 
 def process_one(
-    model: GenerativeModel,
+    client: genai.Client,
+    model_name: str,
     rec: Dict[str, Any],
     retries: int,
 ) -> Dict[str, Any]:
@@ -259,7 +263,7 @@ def process_one(
     full_input = build_full_input(seed, ctx_prompt)
 
     try:
-        out_text = call_model(model, full_input, retries=retries)
+        out_text = call_model(client, model_name, full_input, retries=retries)
         status = "ok"
     except Exception as e:  # noqa: BLE001
         print(
@@ -366,18 +370,18 @@ def main() -> None:
         print("[INFO] nothing to do. all pairs already processed.", file=sys.stderr)
         return
 
-    # Vertex AI 初期化 & モデルロード
+    # Google Gen AI SDK クライアント（Vertex AI モード）初期化
     print(
-        f"[INFO] vertexai.init(project={project_id}, location={location})",
+        f"[INFO] genai.Client(vertexai=True, project={project_id}, location={location})",
         file=sys.stderr,
     )
-    vertexai.init(project=project_id, location=location)
+    client = genai.Client(
+        vertexai=True,
+        project=project_id,
+        location=location,
+    )
 
     print(f"[INFO] using tuned model: {model_name}", file=sys.stderr)
-    model = GenerativeModel(
-        model_name,
-        generation_config=GEN_CONFIG_DEFAULT,
-    )
 
     # 出力ファイルは追記モード
     f_bison = out_bison_path.open("a", encoding="utf-8")
@@ -389,7 +393,7 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [
-            ex.submit(process_one, model, rec, retries)
+            ex.submit(process_one, client, model_name, rec, retries)
             for rec in records
         ]
 
