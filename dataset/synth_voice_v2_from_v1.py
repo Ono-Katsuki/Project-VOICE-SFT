@@ -47,10 +47,10 @@ from google.genai.types import GenerateContentConfig, ThinkingConfig
 PROJECT_ID_DEFAULT = "project-voice-476504"
 LOCATION_DEFAULT = "us-central1"
 
-# ★ v2 tuned model の「エンドポイント名」
+# v2 tuned model の「エンドポイント名」
 # projects/{project}/locations/{location}/endpoints/{endpoint_id}
 TUNED_MODEL_ENDPOINT_DEFAULT = (
-    "projects/700129023625/locations/us-central1/endpoints/2920424929163739136"
+    "projects/700129023625/locations/us-central1/endpoints/8481640393245458432"
 )
 
 # v1 の Bison 形式 JSONL (input_text / output_text)
@@ -277,7 +277,7 @@ def process_one(
             f"[ERROR] giving up on seed_id={seed_id}, ctx={ctx_id}: {e}",
             file=sys.stderr,
         )
-        # ★ エラー時は seed も含め、一切書き出さない方針なので minimum 情報のみ返す
+        # エラー時は seed も含め、一切書き出さない方針なので minimum 情報のみ返す
         return {
             "status": "error",
             "seed_id": seed_id,
@@ -423,7 +423,7 @@ def main() -> None:
         for fut in as_completed(futures):
             result = fut.result()
 
-            # ★ 失敗したレコードは出力ファイルに書かない
+            # 失敗したレコードは出力ファイルに書かない
             if result.get("status") != "ok":
                 done_count += 1
                 print_progress(done_count, total)
