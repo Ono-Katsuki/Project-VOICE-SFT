@@ -19,7 +19,7 @@ v2 チューニング済みモデル (voice-v2) で予測変換データを合�
     - 途中再開:
         既存の Bison 出力の (seed_id, context_id) を見てスキップ
     - 固定プロンプト + 4 文脈プロンプト + シードを user 入力に含める
-    - Gemini 2.5 Flash 系の thinking_budget を 0（思考オフ）で固定
+    - Gemini 2.5 Flash 系チューニングモデルを thinking_budget=0（思考オフ）で呼び出し
 """
 
 import sys
@@ -43,10 +43,11 @@ from google.genai.types import GenerateContentConfig, ThinkingConfig
 PROJECT_ID_DEFAULT = "project-voice-476504"
 LOCATION_DEFAULT = "us-central1"
 
-# v2 tuned model のモデル名（tuning_job.tuned_model.model と同じ形式を想定）
-# 例: projects/.../locations/us-central1/models/1234567890@1
-TUNED_MODEL_NAME_DEFAULT = (
-    "projects/700129023625/locations/us-central1/models/7012041947653079040@1"
+# ★ v2 tuned model の「エンドポイント名」を入れる
+#   Vertex AI Studio の「エンドポイント」欄に出ている:
+#   projects/{project}/locations/{location}/endpoints/{endpoint_id}
+TUNED_MODEL_ENDPOINT_DEFAULT = (
+    "projects/700129023625/locations/us-central1/endpoints/REPLACE_ME"
 )
 
 # v1 の Bison 形式 JSONL (input_text / output_text)
@@ -68,7 +69,7 @@ OUT_GEMINI_JSONL_DEFAULT = (
 # 並列実行数
 MAX_WORKERS_DEFAULT = 4
 
-# モデル呼び出しの最大リトライ回数（-1 で無限リトライ）
+# モデル呼び出しの最大リトライ回数（-1 で無限リトライ *だがレート系のみ無限リトライ*）
 MAX_MODEL_RETRIES_DEFAULT = -1
 
 # thinking_config で thinking_budget=0（思考オフ）を指定
@@ -76,7 +77,7 @@ GEN_CONFIG_DEFAULT = GenerateContentConfig(
     temperature=0.2,
     max_output_tokens=64,
     thinking_config=ThinkingConfig(
-        thinking_budget=0,  # 0 で思考無効（Gemini 2.5 Flash 系仕様）
+        thinking_budget=0,  # 0 で思考無効
     ),
 )
 
@@ -114,6 +115,12 @@ def is_rate_error(e: Exception) -> bool:
         "503",
     ]
     return any(k in msg for k in keywords)
+
+
+def is_not_found_error(e: Exception) -> bool:
+    """404 Not Found 系かざっくり判定。"""
+    msg = str(e).lower()
+    return ("404" in msg) or ("not found" in msg)
 
 
 def print_progress(done: int, total: int) -> None:
@@ -178,15 +185,15 @@ def build_full_input(seed_text: str, context_prompt: str) -> str:
 
 def call_model(
     client: genai.Client,
-    model_name: str,
+    model_endpoint: str,
     full_input: str,
     retries: int,
     base_sleep: float = 0.5,
 ) -> str:
     """
     google-genai Client でテキスト生成。
-    - retries == -1 で無限リトライ
-    - レート制限系は指数バックオフ
+    - retries == -1 でレート制限系のみ無限リトライ
+    - 404 / その他の恒久エラーは retries==-1 でも打ち切る
     """
     attempt = 0
     last_err: Optional[Exception] = None
@@ -195,7 +202,7 @@ def call_model(
         attempt += 1
         try:
             resp = client.models.generate_content(
-                model=model_name,
+                model=model_endpoint,
                 contents=full_input,
                 config=GEN_CONFIG_DEFAULT,
             )
@@ -206,27 +213,34 @@ def call_model(
 
         except Exception as e:  # noqa: BLE001
             last_err = e
-            is_rate = is_rate_error(e)
+            rate = is_rate_error(e)
+            not_found = is_not_found_error(e)
             print(
-                f"[WARN] model call failed (attempt={attempt}, is_rate={is_rate}): {e}",
+                f"[WARN] model call failed (attempt={attempt}, "
+                f"is_rate={rate}, not_found={not_found}): {e}",
                 file=sys.stderr,
             )
 
-            # レート制限・一時エラー → バックオフ
-            if is_rate:
+            # 404 / Not Found は恒久エラーとして即終了
+            if not_found:
+                break
+
+            # レート制限・一時エラー → バックオフ（retries==-1 なら無限リトライ）
+            if rate:
                 backoff = base_sleep * (2 ** min(attempt, 6))
                 backoff += random.uniform(0, 0.5)
                 time.sleep(backoff)
-            else:
-                if retries == -1:
-                    time.sleep(base_sleep)
-                    continue
-                if attempt >= retries:
-                    break
-                time.sleep(base_sleep * attempt)
+                continue
 
-        if retries != -1 and attempt >= retries:
-            break
+            # その他のエラー
+            if retries == -1:
+                # 無限リトライ指定でも、非レートエラーは無限には回さない
+                break
+
+            if attempt >= retries:
+                break
+
+            time.sleep(base_sleep * attempt)
 
     if last_err is None:
         last_err = RuntimeError("Unknown error in call_model.")
@@ -235,7 +249,7 @@ def call_model(
 
 def process_one(
     client: genai.Client,
-    model_name: str,
+    model_endpoint: str,
     rec: Dict[str, Any],
     retries: int,
 ) -> Dict[str, Any]:
@@ -263,7 +277,7 @@ def process_one(
     full_input = build_full_input(seed, ctx_prompt)
 
     try:
-        out_text = call_model(client, model_name, full_input, retries=retries)
+        out_text = call_model(client, model_endpoint, full_input, retries=retries)
         status = "ok"
     except Exception as e:  # noqa: BLE001
         print(
@@ -293,7 +307,14 @@ def main() -> None:
     )
     ap.add_argument("--project-id", default=PROJECT_ID_DEFAULT)
     ap.add_argument("--location", default=LOCATION_DEFAULT)
-    ap.add_argument("--model-name", default=TUNED_MODEL_NAME_DEFAULT)
+    ap.add_argument(
+        "--model-endpoint",
+        default=TUNED_MODEL_ENDPOINT_DEFAULT,
+        help=(
+            "tuned model のエンドポイント名 "
+            "(例: projects/PROJECT/locations/REGION/endpoints/ENDPOINT_ID)"
+        ),
+    )
     ap.add_argument("--v1-bison-jsonl", default=V1_BISON_JSONL_DEFAULT)
     ap.add_argument("--out-bison", default=OUT_BISON_JSONL_DEFAULT)
     ap.add_argument("--out-gemini", default=OUT_GEMINI_JSONL_DEFAULT)
@@ -302,14 +323,14 @@ def main() -> None:
         "--retries",
         type=int,
         default=MAX_MODEL_RETRIES_DEFAULT,
-        help="-1 で無限リトライ",
+        help="-1 でレート制限系のみ無限リトライ",
     )
 
     args = ap.parse_args()
 
     project_id = args.project_id
     location = args.location
-    model_name = args.model_name
+    model_endpoint = args.model_endpoint
     v1_path = Path(args.v1_bison_jsonl)
     out_bison_path = Path(args.out_bison)
     out_gemini_path = Path(args.out_gemini)
@@ -381,7 +402,7 @@ def main() -> None:
         location=location,
     )
 
-    print(f"[INFO] using tuned model: {model_name}", file=sys.stderr)
+    print(f"[INFO] using tuned model endpoint: {model_endpoint}", file=sys.stderr)
 
     # 出力ファイルは追記モード
     f_bison = out_bison_path.open("a", encoding="utf-8")
@@ -393,7 +414,7 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [
-            ex.submit(process_one, client, model_name, rec, retries)
+            ex.submit(process_one, client, model_endpoint, rec, retries)
             for rec in records
         ]
 
