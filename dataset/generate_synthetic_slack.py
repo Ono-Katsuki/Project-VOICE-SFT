@@ -18,27 +18,17 @@ except ImportError:
     print("pip install google-genai が必要です", file=sys.stderr)
     sys.exit(1)
 
-# -----------------------------
-# Model / Config
-# -----------------------------
 MODEL_GEN = "gemini-2.5-flash"
 NO_THINKING_CONFIG = {"thinking_config": {"thinking_budget": 0}}
 
-MAX_GEN_RETRIES = 3  # 生成がNGのときの再試行回数（generate_one内）
-MAX_WORKER_RETRIES = 3  # API例外時のワーカー側再試行回数（レート制限等）
+MAX_WORKER_RETRIES = 3  # レート以外の例外でworker側が諦める回数（retries!=-1の時だけ効く）
 
-# -----------------------------
-# Exhaustive lists (given)
-# -----------------------------
 SELF_ROLES = ["テックリーダー", "マネジメント", "エンジニア", "ビジネス"]
 OTHER_ROLES = ["上司", "部下", "取引先", "お客様", "ビジネスパートナー", "同僚", "リーダー", "メンバー"]
 RELATIONS = ["親しい", "仲が悪い", "要注意な", "頼みやすい", "頼みにくい", "優しい", "厳しい", "疎遠な"]
 CONTENTS = ["肯定", "否定", "提案", "依頼", "催促", "報告", "相談", "連絡"]
 SCENES = ["ビジネス", "開発", "マネジメント", "プレゼン"]
 
-# -----------------------------
-# Prompt
-# -----------------------------
 GEN_PROMPT = """あなたは社内/社外のSlackで使われる、日本語の短い発言（1〜3文）を作るアシスタントです。
 
 【目的】
@@ -60,9 +50,6 @@ GEN_PROMPT = """あなたは社内/社外のSlackで使われる、日本語の�
 </GEN>
 """
 
-# -----------------------------
-# Utilities
-# -----------------------------
 def get_client() -> genai.Client:
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -133,7 +120,6 @@ def parse_gen(full: str) -> Tuple[bool, str, str]:
     raw = m.group(1).strip() if m else full.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-
     try:
         obj = json.loads(raw)
         text = str(obj.get("text", "")).strip()
@@ -158,7 +144,7 @@ def evaluate_text(text: str) -> Tuple[bool, str]:
     return True, ""
 
 def build_user_input(meta: Dict[str, str], style_seed: str) -> str:
-    hints = [
+    return "\n".join([
         f"自分の役割: {meta['self_role']}",
         f"相手: {meta['other_role']}",
         f"相手との関係性: {meta['relation']}（トーン: {relation_tone_hint(meta['relation'])}）",
@@ -166,18 +152,20 @@ def build_user_input(meta: Dict[str, str], style_seed: str) -> str:
         f"シーン: {meta['scene']}（話題の寄せ: {content_hint(meta['scene'], meta['content'])}）",
         f"バリエーション種: {style_seed}",
         "注意: 固有名詞・個人情報は出さない。1〜3文。Slackの本文だけ。",
-    ]
-    return "\n".join(hints)
+    ])
 
-# -----------------------------
-# One record generation (NO fallback)
-# -----------------------------
-def generate_one(client: genai.Client, meta: Dict[str, str], retries: int = MAX_GEN_RETRIES) -> Dict[str, Any]:
+# ★ retries=-1 でも本当に回るように修正
+def generate_one(client: genai.Client, meta: Dict[str, str], retries: int) -> Dict[str, Any]:
     style_seed = meta.get("style_seed", "A")
     feedback = ""
     last_full = ""
 
-    for attempt in range(retries + 1):
+    attempt = 0
+    while True:
+        attempt += 1
+        if retries != -1 and attempt > (retries + 1):
+            raise RuntimeError(f"generate_one failed after retries. last_output={last_full[:300]!r}")
+
         user_input = build_user_input(meta, style_seed)
         instr = GEN_PROMPT
         if feedback:
@@ -230,12 +218,6 @@ def generate_one(client: genai.Client, meta: Dict[str, str], retries: int = MAX_
             "を満たしてください。"
         )
 
-    # fallbackしない：失敗として扱う
-    raise RuntimeError(f"generate_one failed after retries. last_output={last_full[:300]!r}")
-
-# -----------------------------
-# Progress
-# -----------------------------
 def print_progress(done: int, total: int):
     width = 50
     ratio = done / total if total else 1.0
@@ -247,25 +229,27 @@ def print_progress(done: int, total: int):
     if done == total:
         sys.stdout.write("\n")
 
-# -----------------------------
-# Worker wrapper
-# -----------------------------
-def worker_generate_with_backoff(client: genai.Client, meta: Dict[str, str], gen_retries: int) -> Dict[str, Any]:
+# クライアントをスレッドローカル化（google-genaiのスレッド安全性が不明なので保険）
+_thread_local = threading.local()
+def get_thread_client() -> genai.Client:
+    if not hasattr(_thread_local, "client"):
+        _thread_local.client = get_client()
+    return _thread_local.client
+
+def worker(meta: Dict[str, str], retries: int) -> Dict[str, Any]:
     attempt = 0
     while True:
         attempt += 1
         try:
-            return generate_one(client, meta, retries=gen_retries)
+            client = get_thread_client()
+            return generate_one(client, meta, retries=retries)
         except Exception as e:
-            rate = is_rate_error(e)
-            if rate:
+            if is_rate_error(e):
                 backoff = 0.6 * (2 ** min(attempt, 6)) + random.uniform(0, 0.5)
                 time.sleep(backoff)
                 continue
 
-            # 非レート系は一定回数で諦めて上位に投げる（failed.jsonlへ）
-            if gen_retries == -1:
-                # 無限生成モードなら、非レートでも少し待って継続
+            if retries == -1:
                 time.sleep(0.5)
                 continue
 
@@ -273,19 +257,16 @@ def worker_generate_with_backoff(client: genai.Client, meta: Dict[str, str], gen
                 raise
             time.sleep(0.3 * attempt)
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     import argparse
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--output", default="dataset/cleaned.jsonl")
     ap.add_argument("--failed-output", default="dataset/failed.jsonl")
-    ap.add_argument("--variants", type=int, default=1, help="各組合せあたりのバリエーション数")
-    ap.add_argument("--limit", type=int, default=None, help="生成件数の上限（デバッグ用）")
+    ap.add_argument("--variants", type=int, default=1)
+    ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--max-workers", type=int, default=6)
-    ap.add_argument("--retries", type=int, default=3, help="-1 で無限リトライ（全組合せを埋めたい場合）")
+    ap.add_argument("--retries", type=int, default=3, help="-1 で無限リトライ")
     ap.add_argument("--shuffle", action="store_true")
     args = ap.parse_args()
 
@@ -294,7 +275,9 @@ def main():
     outp.parent.mkdir(parents=True, exist_ok=True)
     failp.parent.mkdir(parents=True, exist_ok=True)
 
-    # 途中再開：既に出力済みの key を読む
+    # API key があるか先にチェック（ここで落ちるなら即分かる）
+    _ = get_client()
+
     processed_keys = set()
     if outp.exists():
         with outp.open("r", encoding="utf-8") as f:
@@ -356,30 +339,39 @@ def main():
         print("no new records.")
         return
 
-    client = get_client()
     lock = threading.Lock()
-
     done = 0
     failed = 0
     print_progress(done, total)
 
+    future_to_meta = {}
+
     with outp.open("a", encoding="utf-8") as outf, failp.open("a", encoding="utf-8") as ferr:
         with ThreadPoolExecutor(max_workers=min(args.max_workers, 50)) as ex:
-            futures = [ex.submit(worker_generate_with_backoff, client, m, args.retries) for m in metas]
+            for m in metas:
+                fut = ex.submit(worker, m, args.retries)
+                future_to_meta[fut] = m
 
-            for i, fut in enumerate(as_completed(futures), 1):
+            for fut in as_completed(future_to_meta):
+                m = future_to_meta[fut]
                 try:
                     rec = fut.result()
                     with lock:
                         outf.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         outf.flush()
                 except Exception as e:
-                    # fallbackしない：失敗は別ファイルに記録して clean から除外
                     failed += 1
-                    # 対応するmetaは取り出せないので、例外情報のみ書くのは弱い → future順なので完全一致はできない
-                    # そこで fut に紐づく meta を保持したい場合は、submit時に meta をクロージャに含める等に変更してください。
-                    # ここでは簡易的にエラーだけ残す。
-                    err = {"error": str(e)}
+                    err = {
+                        "key": m["key"],
+                        "id": m["id"],
+                        "self_role": m["self_role"],
+                        "other_role": m["other_role"],
+                        "relation": m["relation"],
+                        "content": m["content"],
+                        "scene": m["scene"],
+                        "variant": m["variant"],
+                        "error": str(e),
+                    }
                     with lock:
                         ferr.write(json.dumps(err, ensure_ascii=False) + "\n")
                         ferr.flush()
