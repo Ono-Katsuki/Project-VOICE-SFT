@@ -28,7 +28,7 @@ LOCAL_VALID_FILE = ""
 SOURCE_MODEL = "gemini-2.5-flash"
 TUNED_MODEL_DISPLAY_NAME = "voice-v7"
 
-EPOCHS = 1
+EPOCHS = None
 ADAPTER_SIZE = None
 LR_MULTIPLIER = None
 
