@@ -35,57 +35,112 @@ SEED_JSONL_DEFAULT = (
 # 出力
 OUT_BISON_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
-    "synth_v11_tone8_bison.jsonl"
+    "synth_v11_tone8_bison__strongtone.jsonl"
 )
 OUT_GEMINI_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
-    "synth_v11_tone8_gemini.jsonl"
+    "synth_v11_tone8_gemini__strongtone.jsonl"
 )
 
 # seed単位の評価ログ（モデル評価に便利）
 SEED_METRICS_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
-    "synth_v11_tone8_seed_metrics.jsonl"
+    "synth_v11_tone8_seed_metrics__strongtone.jsonl"
 )
 
 MAX_WORKERS_DEFAULT = 4
 MAX_MODEL_RETRIES_DEFAULT = -1  # -1: rate系のみ無限バックオフ
 
-# 生成設定（基本）
-GEN_CONFIG_BASE = GenerateContentConfig(
-    temperature=0.2,
-    max_output_tokens=256,
-    thinking_config=ThinkingConfig(thinking_budget=0),
-)
-
-# 多様性リトライ用（温度↑）
-GEN_CONFIG_DIVERSITY = GenerateContentConfig(
-    temperature=0.85,
-    max_output_tokens=256,
-    thinking_config=ThinkingConfig(thinking_budget=0),
-)
+# ループ/長文が混ざるのを減らすため、デフォルトは 96 にしておく（必要ならCLIで上書き）
+BASE_MAX_OUTPUT_TOKENS_DEFAULT = 96
+BASE_TEMPERATURE_DEFAULT = 0.2
+DIVERSITY_TEMPERATURE_DEFAULT = 0.85
 
 # v11固定（ヘッダ＋マーカーの間に TONE を差し込む）
-FIXED_PROMPT_HEADER = """キーボードの予測変換として[---]に続く言葉を予測変換してください。[---]より前はこれまでのユーザー入力です。
-ユーザー入力と予測変換の間には境界 [---]を入れてください。"""
+FIXED_PROMPT_HEADER = (
+    "キーボードの予測変換として[---]に続く言葉を予測変換してください。[---]より前はこれまでのユーザー入力です。\n"
+    "ユーザー入力と予測変換の間には境界 [---]を入れてください。"
+)
 MARKER_LINE = "ーーーー以下が予測変換対象ーーーー"
 
-# ====== トーン 8つ ======
+# ====== トーン 8つ（強化版） ======
+# 重要:
+# - [---]より前は絶対に変更しない
+# - [---]より後のみ / 区切りで出す
+# - 繰り返し禁止 / 長すぎ抑制 / トーン差を具体語彙で誘導
 CONTEXTS: List[Tuple[str, str]] = [
-    ("dev",          "開発の文脈で予測変換してください。"),
-    ("meeting",      "ミーティングの文脈で予測変換してください。"),
-    ("casual",       "カジュアルな文脈で予測変換してください。"),
-    ("business",     "ビジネスの文脈で予測変換してください。"),
-    ("polite",       "丁寧で敬語の文脈で予測変換してください。"),
-    ("friendly",     "親しみやすい文脈で予測変換してください。"),
-    ("concise",      "短く要点だけの文脈で予測変換してください。"),
-    ("enthusiastic", "明るく前向きな文脈で予測変換してください。"),
+    (
+        "dev",
+        "【トーン: dev】開発の文脈で予測変換してください。"
+        "開発寄り語彙（例: PR/レビュー/デプロイ/issue/バグ/再現/修正/ログ/確認）を優先。"
+        "語尾はフラットで自然（です/ますでも可）。"
+        "同じ語句や同じ文の繰り返しは禁止。"
+        "[---]より前は一文字も変更せず、[---]より後のみを / 区切りで出力してください。"
+    ),
+    (
+        "meeting",
+        "【トーン: meeting】ミーティングの文脈で予測変換してください。"
+        "会議語彙（例: 議題/アジェンダ/共有/確認事項/宿題/決定/進捗/次回）を優先。"
+        "結びは『〜します』『〜しましょう』『〜いかがでしょうか』など会議っぽく。"
+        "同じ語句や同じ文の繰り返しは禁止。"
+        "[---]より前は一文字も変更せず、[---]より後のみを / 区切りで出力してください。"
+    ),
+    (
+        "casual",
+        "【トーン: casual】カジュアルな文脈で予測変換してください。"
+        "砕けた口語（例: だよ/だね/しよ/しよう/かな/だと思う）を優先し、敬語はなるべく避ける。"
+        "ただし乱暴な表現は避けて自然に。"
+        "同じ語句や同じ文の繰り返しは禁止。"
+        "[---]より前は一文字も変更せず、[---]より後のみを / 区切りで出力してください。"
+    ),
+    (
+        "business",
+        "【トーン: business】ビジネスの文脈で予測変換してください。"
+        "実務的で丁寧（例: 恐れ入りますが/ご確認のほど/差し支えなければ/よろしくお願いいたします）を優先。"
+        "長くなりすぎないように [---]より後は原則 20 トークン（/区切りで20個）以内を目安。"
+        "同じ語句や同じ文の繰り返しは禁止。"
+        "[---]より前は一文字も変更せず、[---]より後のみを / 区切りで出力してください。"
+    ),
+    (
+        "polite",
+        "【トーン: polite】丁寧・敬語の文脈で予測変換してください。"
+        "です/ます調＋クッション言葉（例: お手数ですが/恐れ入りますが/ありがとうございます）を優先。"
+        "ビジネスほど堅くしすぎず、丁寧さを保った自然文に。"
+        "同じ語句や同じ文の繰り返しは禁止。"
+        "[---]より前は一文字も変更せず、[---]より後のみを / 区切りで出力してください。"
+    ),
+    (
+        "friendly",
+        "【トーン: friendly】親しみやすい文脈で予測変換してください。"
+        "柔らかい語尾（例: 〜ですね/〜だと嬉しいです/〜しよう）や感謝を入れてもよい。"
+        "ただし過剰に長くしない。"
+        "同じ語句や同じ文の繰り返しは禁止。"
+        "[---]より前は一文字も変更せず、[---]より後のみを / 区切りで出力してください。"
+    ),
+    (
+        "concise",
+        "【トーン: concise】短く要点だけの文脈で予測変換してください。"
+        "冗長な前置きは避け、[---]より後は原則 8〜12 トークン（/区切りで8〜12個）程度を目安に短く。"
+        "敬語は必要最低限に。"
+        "同じ語句や同じ文の繰り返しは禁止。"
+        "[---]より前は一文字も変更せず、[---]より後のみを / 区切りで出力してください。"
+    ),
+    (
+        "enthusiastic",
+        "【トーン: enthusiastic】明るく前向きな文脈で予測変換してください。"
+        "前向き語彙（例: いいですね/助かります/楽しみ/最高/嬉しい）を適度に使い、"
+        "必要なら『！』を1個だけ入れてもよい（多用しない）。"
+        "同じ語句や同じ文の繰り返しは禁止。"
+        "[---]より前は一文字も変更せず、[---]より後のみを / 区切りで出力してください。"
+    ),
 ]
 
-# 多様性を促す追記（リトライ時のみ、MARKERの前＝tone行に追加）
+# 多様性を促す追記（リトライ時のみ）
 DIVERSITY_SUFFIX = (
-    "上のトーンに合わせて、語彙・語尾・文体の差が明確に出るようにしてください。"
-    "ただし形式（[---] と / 区切り）は必ず維持してください。"
+    "【多様性強化】他のトーン出力と被らないように、[---]より後の「語彙・語尾・敬語レベル・情報量・長さ」を明確に変えてください。"
+    "同じ意味や同じ句の繰り返しは禁止です。"
+    "長くなりすぎる場合は短くまとめてください。"
+    "形式（[---] と / 区切り）と、[---]より前の文字列は必ず維持してください。"
 )
 
 # 形式維持リトライ回数（各トーン）
@@ -147,8 +202,10 @@ def extract_seed_text(raw_user_text: str) -> str:
     if MARKER_LINE in t:
         return t.rsplit(MARKER_LINE, 1)[1].strip()
 
+    # 固定ヘッダを剥がす（完全一致時のみ）
     t = _strip_prefix_once(t, FIXED_PROMPT_HEADER.strip())
 
+    # 文脈プロンプト（完全一致時のみ）を剥がす
     context_prompts = [cp for _, cp in CONTEXTS]
     changed = True
     while changed:
@@ -158,6 +215,10 @@ def extract_seed_text(raw_user_text: str) -> str:
             t = _strip_prefix_once(t, cp)
             if t != before:
                 changed = True
+
+    # マーカーっぽい行だけ残っているケースを軽く救済
+    t = _strip_prefix_once(t, MARKER_LINE)
+
     return t.strip()
 
 def build_full_input(seed_text: str, tone_prompt: str) -> str:
@@ -186,7 +247,7 @@ def validate_output(seed_text: str, output_text: str) -> Tuple[bool, str]:
     形式維持チェック（厳しめ）:
       - output に [---] が1回
       - seed_text に [---] が1回
-      - [---] 前の文脈が一致
+      - [---] 前の文脈が一致（完全一致）
       - [---] 後に / が含まれ、空トークンなし（'//'なし）
       - トークンが空白/前後空白を含まない
     """
@@ -365,6 +426,7 @@ def generate_one_tone(
     model_endpoint: str,
     seed_text: str,
     tone_prompt: str,
+    gen_config_base: GenerateContentConfig,
     retries: int,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
@@ -388,7 +450,7 @@ def generate_one_tone(
     for _ in range(MAX_FORMAT_RETRIES_PER_CONTEXT + 1):
         meta["format_attempts"] += 1
         try:
-            out, m = call_model(client, model_endpoint, full_input, GEN_CONFIG_BASE, retries=retries)
+            out, m = call_model(client, model_endpoint, full_input, gen_config_base, retries=retries)
             out = out.strip()
             meta["model_attempts"] += int(m.get("model_attempts", 1))
             meta["latency_sec_total"] += float(m.get("latency_sec_total", 0.0))
@@ -414,6 +476,7 @@ def improve_diversity_for_tone(
     seed_text: str,
     base_tone_prompt: str,
     existing_outputs: List[str],
+    gen_config_diversity: GenerateContentConfig,
     retries: int,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
@@ -437,7 +500,7 @@ def improve_diversity_for_tone(
     for _ in range(MAX_DIVERSITY_RETRIES_PER_CONTEXT):
         meta["diversity_attempts"] += 1
         try:
-            out, m = call_model(client, model_endpoint, full_input, GEN_CONFIG_DIVERSITY, retries=retries)
+            out, m = call_model(client, model_endpoint, full_input, gen_config_diversity, retries=retries)
             out = out.strip()
             meta["model_attempts"] += int(m.get("model_attempts", 1))
             meta["latency_sec_total"] += float(m.get("latency_sec_total", 0.0))
@@ -469,6 +532,8 @@ def process_seed(
     model_endpoint: str,
     seed_id: int,
     seed_text: str,
+    gen_config_base: GenerateContentConfig,
+    gen_config_diversity: GenerateContentConfig,
     retries: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[float]]:
     """
@@ -482,7 +547,9 @@ def process_seed(
 
     # まず形式優先で8本
     for tone_id, tone_prompt in CONTEXTS:
-        out, meta = generate_one_tone(client, model_endpoint, seed_text, tone_prompt, retries=retries)
+        out, meta = generate_one_tone(
+            client, model_endpoint, seed_text, tone_prompt, gen_config_base, retries=retries
+        )
         outputs[tone_id] = out
         metas[tone_id] = meta
         latencies.append(float(meta.get("latency_sec_last", 0.0)))
@@ -507,7 +574,13 @@ def process_seed(
             if sim >= SIMILARITY_TOO_HIGH:
                 existing = [o for o in outputs.values() if o is not None]
                 new_out, dmeta = improve_diversity_for_tone(
-                    client, model_endpoint, seed_text, tone_prompt, existing_outputs=existing, retries=retries
+                    client,
+                    model_endpoint,
+                    seed_text,
+                    tone_prompt,
+                    existing_outputs=existing,
+                    gen_config_diversity=gen_config_diversity,
+                    retries=retries,
                 )
                 if new_out is not None:
                     outputs[tone_id] = new_out
@@ -522,7 +595,7 @@ def process_seed(
         unique_n = len({normalize_for_compare(o) for o in ok_outputs if o})
 
     # 類似度統計
-    pairs = [(a, b) for i, a in enumerate(ok_outputs) for b in ok_outputs[i+1:]]
+    pairs = [(a, b) for i, a in enumerate(ok_outputs) for b in ok_outputs[i + 1:]]
     if pairs:
         sims = [seq_similarity(a, b) for a, b in pairs]
         max_sim = max(sims)
@@ -609,9 +682,27 @@ def main() -> None:
     ap.add_argument("--no-seed-dedup", action="store_true")
     ap.add_argument("--report-every", type=int, default=50)
     ap.add_argument("--random-seed", type=int, default=20251219)
+
+    # 生成パラメータをCLIで調整できるように
+    ap.add_argument("--max-output-tokens", type=int, default=BASE_MAX_OUTPUT_TOKENS_DEFAULT)
+    ap.add_argument("--temperature", type=float, default=BASE_TEMPERATURE_DEFAULT)
+    ap.add_argument("--diversity-temperature", type=float, default=DIVERSITY_TEMPERATURE_DEFAULT)
+
     args = ap.parse_args()
 
     random.seed(args.random_seed)
+
+    # 生成設定（基本 / 多様性）
+    gen_config_base = GenerateContentConfig(
+        temperature=float(args.temperature),
+        max_output_tokens=int(args.max_output_tokens),
+        thinking_config=ThinkingConfig(thinking_budget=0),
+    )
+    gen_config_diversity = GenerateContentConfig(
+        temperature=float(args.diversity_temperature),
+        max_output_tokens=int(args.max_output_tokens),
+        thinking_config=ThinkingConfig(thinking_budget=0),
+    )
 
     seed_path = Path(args.seed_jsonl)
     out_bison_path = Path(args.out_bison)
@@ -636,6 +727,11 @@ def main() -> None:
     total = len(seeds)
     print(f"[INFO] seeds to process={total} (tones={len(CONTEXTS)})", file=sys.stderr)
     print(f"[INFO] model endpoint default={TUNED_MODEL_ENDPOINT_DEFAULT}", file=sys.stderr)
+    print(
+        f"[INFO] gen_config: temp={args.temperature}, div_temp={args.diversity_temperature}, "
+        f"max_output_tokens={args.max_output_tokens}",
+        file=sys.stderr,
+    )
 
     client = genai.Client(vertexai=True, project=args.project_id, location=args.location)
 
@@ -661,7 +757,18 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = []
         for seed_id, seed_text in enumerate(seeds):
-            futures.append(ex.submit(process_seed, client, args.model_endpoint, seed_id, seed_text, args.retries))
+            futures.append(
+                ex.submit(
+                    process_seed,
+                    client,
+                    args.model_endpoint,
+                    seed_id,
+                    seed_text,
+                    gen_config_base,
+                    gen_config_diversity,
+                    args.retries,
+                )
+            )
 
         for fut in as_completed(futures):
             recs, seedm, lat_list = fut.result()
@@ -705,10 +812,12 @@ def main() -> None:
 
             if args.report_every > 0 and done % args.report_every == 0:
                 lat_sorted = sorted(all_latencies)
+
                 def _p(q: float) -> float:
                     if not lat_sorted:
                         return 0.0
                     return lat_sorted[int((len(lat_sorted) - 1) * q)]
+
                 p50 = _p(0.50)
                 p90 = _p(0.90)
                 p99 = _p(0.99)
