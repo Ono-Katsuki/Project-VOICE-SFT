@@ -7,7 +7,7 @@ import time
 import random
 import threading
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 import difflib
@@ -21,18 +21,15 @@ from google.genai.types import GenerateContentConfig, ThinkingConfig
 PROJECT_ID_DEFAULT = "project-voice-476504"
 LOCATION_DEFAULT = "us-central1"
 
-# v11 tuned model endpoint（指定どおり）
 TUNED_MODEL_ENDPOINT_DEFAULT = (
     "projects/700129023625/locations/us-central1/endpoints/2546212743719944192"
 )
 
-# seed JSONL (Gemini/Bisonどちらでも)
 SEED_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
     "voice_boundaryrule_ctxinout_prefix1to3_vark_onebest_gemini__strict_with_userprefix.jsonl"
 )
 
-# 出力
 OUT_BISON_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
     "synth_v11_tone8_bison__strongtone.jsonl"
@@ -41,8 +38,6 @@ OUT_GEMINI_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
     "synth_v11_tone8_gemini__strongtone.jsonl"
 )
-
-# seed単位の評価ログ（モデル評価に便利）
 SEED_METRICS_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
     "synth_v11_tone8_seed_metrics__strongtone.jsonl"
@@ -51,12 +46,10 @@ SEED_METRICS_JSONL_DEFAULT = (
 MAX_WORKERS_DEFAULT = 4
 MAX_MODEL_RETRIES_DEFAULT = -1  # -1: rate系のみ無限バックオフ
 
-# ループ/長文が混ざるのを減らすため、デフォルトは 96 にしておく（必要ならCLIで上書き）
-BASE_MAX_OUTPUT_TOKENS_DEFAULT = 96
-BASE_TEMPERATURE_DEFAULT = 0.2
-DIVERSITY_TEMPERATURE_DEFAULT = 0.85
+# デフォルトは 96 にして長文/ループを抑える（必要ならCLIで上書き）
+DEFAULT_MAX_OUTPUT_TOKENS = 96
 
-# v11固定（ヘッダ＋マーカーの間に TONE を差し込む）
+# v11固定
 FIXED_PROMPT_HEADER = (
     "キーボードの予測変換として[---]に続く言葉を予測変換してください。[---]より前はこれまでのユーザー入力です。\n"
     "ユーザー入力と予測変換の間には境界 [---]を入れてください。"
@@ -64,10 +57,6 @@ FIXED_PROMPT_HEADER = (
 MARKER_LINE = "ーーーー以下が予測変換対象ーーーー"
 
 # ====== トーン 8つ（強化版） ======
-# 重要:
-# - [---]より前は絶対に変更しない
-# - [---]より後のみ / 区切りで出す
-# - 繰り返し禁止 / 長すぎ抑制 / トーン差を具体語彙で誘導
 CONTEXTS: List[Tuple[str, str]] = [
     (
         "dev",
@@ -135,7 +124,6 @@ CONTEXTS: List[Tuple[str, str]] = [
     ),
 ]
 
-# 多様性を促す追記（リトライ時のみ）
 DIVERSITY_SUFFIX = (
     "【多様性強化】他のトーン出力と被らないように、[---]より後の「語彙・語尾・敬語レベル・情報量・長さ」を明確に変えてください。"
     "同じ意味や同じ句の繰り返しは禁止です。"
@@ -143,19 +131,41 @@ DIVERSITY_SUFFIX = (
     "形式（[---] と / 区切り）と、[---]より前の文字列は必ず維持してください。"
 )
 
-# 形式維持リトライ回数（各トーン）
+# リトライ回数
 MAX_FORMAT_RETRIES_PER_CONTEXT = 2
-
-# 多様性リトライ回数（各トーン）
 MAX_DIVERSITY_RETRIES_PER_CONTEXT = 2
 
-# 多様性判定
-MIN_UNIQUE_PER_SEED = 3         # 8本中ユニークがこれ未満なら「多様性弱い」
-SIMILARITY_TOO_HIGH = 0.97      # これ以上の類似は「似すぎ」
+# 多様性判定（強めに効かせたいなら threshold を下げる）
+MIN_UNIQUE_PER_SEED = 3
+SIMILARITY_TOO_HIGH = 0.97
+
+# 似すぎ潰しを “business基準” じゃなく “ペアワイズ” でやる回数
+PAIRWISE_DIVERSITY_ROUNDS = 2
 
 PROGRESS_BAR_WIDTH = 50
 
-# ========= ここまで =========
+# トーン別温度（重要：ここが効く）
+# 無難収束しがちな business/polite/concise は低め、casual/enthusiastic は高めに
+BASE_TEMP_BY_TONE: Dict[str, float] = {
+    "dev": 0.28,
+    "meeting": 0.25,
+    "casual": 0.55,
+    "business": 0.20,
+    "polite": 0.22,
+    "friendly": 0.35,
+    "concise": 0.20,
+    "enthusiastic": 0.65,
+}
+DIVERSITY_TEMP_BY_TONE: Dict[str, float] = {
+    "dev": 0.95,
+    "meeting": 0.85,
+    "casual": 1.05,
+    "business": 0.80,
+    "polite": 0.80,
+    "friendly": 0.95,
+    "concise": 0.80,
+    "enthusiastic": 1.10,
+}
 
 
 # --- 基本ユーティリティ ------------------------------------------------------
@@ -190,11 +200,6 @@ def _strip_prefix_once(text: str, prefix: str) -> str:
     return text
 
 def extract_seed_text(raw_user_text: str) -> str:
-    """
-    seed側に固定文/文脈/マーカーが混入しても seed 部分だけ抽出して重複を防ぐ。
-    - MARKER_LINE があれば「最後の MARKER_LINE 以降」だけ使う
-    - なければ固定ヘッダ/文脈が先頭にあれば剥がす
-    """
     if not isinstance(raw_user_text, str):
         return ""
     t = raw_user_text.strip()
@@ -202,10 +207,8 @@ def extract_seed_text(raw_user_text: str) -> str:
     if MARKER_LINE in t:
         return t.rsplit(MARKER_LINE, 1)[1].strip()
 
-    # 固定ヘッダを剥がす（完全一致時のみ）
     t = _strip_prefix_once(t, FIXED_PROMPT_HEADER.strip())
 
-    # 文脈プロンプト（完全一致時のみ）を剥がす
     context_prompts = [cp for _, cp in CONTEXTS]
     changed = True
     while changed:
@@ -216,19 +219,10 @@ def extract_seed_text(raw_user_text: str) -> str:
             if t != before:
                 changed = True
 
-    # マーカーっぽい行だけ残っているケースを軽く救済
     t = _strip_prefix_once(t, MARKER_LINE)
-
     return t.strip()
 
 def build_full_input(seed_text: str, tone_prompt: str) -> str:
-    """
-    TONE は MARKER_LINE の直前に入れる:
-      FIXED_PROMPT_HEADER
-      tone_prompt
-      MARKER_LINE
-      seed_text
-    """
     seed_text = extract_seed_text(seed_text)
     return f"{FIXED_PROMPT_HEADER}\n{tone_prompt}\n{MARKER_LINE}\n{seed_text}"
 
@@ -243,14 +237,6 @@ def seq_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 def validate_output(seed_text: str, output_text: str) -> Tuple[bool, str]:
-    """
-    形式維持チェック（厳しめ）:
-      - output に [---] が1回
-      - seed_text に [---] が1回
-      - [---] 前の文脈が一致（完全一致）
-      - [---] 後に / が含まれ、空トークンなし（'//'なし）
-      - トークンが空白/前後空白を含まない
-    """
     if not output_text:
         return False, "empty_output"
     if output_text.count("[---]") != 1:
@@ -277,6 +263,16 @@ def validate_output(seed_text: str, output_text: str) -> Tuple[bool, str]:
 
     return True, "ok"
 
+def after_token_count(output_text: str) -> int:
+    # output_text は validate_output 通過前提じゃないので安全に
+    if not output_text or "[---]" not in output_text:
+        return 0
+    try:
+        _, out_after = output_text.split("[---]", 1)
+    except ValueError:
+        return 0
+    return len([t for t in out_after.split("/") if t != ""])
+
 
 # --- レイテンシ統計 ----------------------------------------------------------
 
@@ -301,13 +297,6 @@ def call_model(
     retries: int,
     base_sleep: float = 0.5,
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    戻り: (text, meta)
-    meta:
-      - model_attempts
-      - latency_sec_total
-      - latency_sec_last
-    """
     attempt = 0
     last_err: Optional[Exception] = None
     latency_total = 0.0
@@ -419,19 +408,50 @@ def load_seeds(seed_path: Path, dedup: bool = True) -> List[str]:
     return out
 
 
+# --- 追記出力の重複防止（再実行時） ------------------------------------------
+
+def load_processed_pairs_from_bison(path: Path) -> Set[Tuple[str, str]]:
+    processed: Set[Tuple[str, str]] = set()
+    if not path.exists():
+        return processed
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            seed = obj.get("seed")
+            tone_id = obj.get("tone_id")
+            if isinstance(seed, str) and isinstance(tone_id, str):
+                processed.add((seed, tone_id))
+    return processed
+
+
+# --- 生成 config -------------------------------------------------------------
+
+def make_config(temp: float, max_tokens: int) -> GenerateContentConfig:
+    return GenerateContentConfig(
+        temperature=float(temp),
+        max_output_tokens=int(max_tokens),
+        thinking_config=ThinkingConfig(thinking_budget=0),
+    )
+
+
 # --- 形式維持＋多様性の評価＆必要ならリトライ --------------------------------
 
 def generate_one_tone(
     client: genai.Client,
     model_endpoint: str,
     seed_text: str,
+    tone_id: str,
     tone_prompt: str,
-    gen_config_base: GenerateContentConfig,
+    base_temp_scale: float,
+    max_output_tokens: int,
     retries: int,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    1トーン生成：形式維持チェックに通るまでリトライ
-    """
     meta: Dict[str, Any] = {
         "format_attempts": 0,
         "format_ok": False,
@@ -447,10 +467,13 @@ def generate_one_tone(
     full_input = build_full_input(seed_text, tone_prompt)
     seed_line = extract_seed_text(seed_text)
 
+    base_temp = BASE_TEMP_BY_TONE.get(tone_id, 0.2) * base_temp_scale
+    gen_config = make_config(base_temp, max_output_tokens)
+
     for _ in range(MAX_FORMAT_RETRIES_PER_CONTEXT + 1):
         meta["format_attempts"] += 1
         try:
-            out, m = call_model(client, model_endpoint, full_input, gen_config_base, retries=retries)
+            out, m = call_model(client, model_endpoint, full_input, gen_config, retries=retries)
             out = out.strip()
             meta["model_attempts"] += int(m.get("model_attempts", 1))
             meta["latency_sec_total"] += float(m.get("latency_sec_total", 0.0))
@@ -474,14 +497,13 @@ def improve_diversity_for_tone(
     client: genai.Client,
     model_endpoint: str,
     seed_text: str,
+    tone_id: str,
     base_tone_prompt: str,
     existing_outputs: List[str],
-    gen_config_diversity: GenerateContentConfig,
+    diversity_temp_scale: float,
+    max_output_tokens: int,
     retries: int,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    既存出力に似すぎる場合、温度↑ + 指示強化で多様性リトライ。
-    """
     meta: Dict[str, Any] = {
         "diversity_attempts": 0,
         "diversity_ok": False,
@@ -494,13 +516,16 @@ def improve_diversity_for_tone(
     seed_line = extract_seed_text(seed_text)
     full_input = build_full_input(seed_line, tone_prompt)
 
+    div_temp = DIVERSITY_TEMP_BY_TONE.get(tone_id, 0.85) * diversity_temp_scale
+    gen_config = make_config(div_temp, max_output_tokens)
+
     best_out: Optional[str] = None
     best_sim = 1.0
 
     for _ in range(MAX_DIVERSITY_RETRIES_PER_CONTEXT):
         meta["diversity_attempts"] += 1
         try:
-            out, m = call_model(client, model_endpoint, full_input, gen_config_diversity, retries=retries)
+            out, m = call_model(client, model_endpoint, full_input, gen_config, retries=retries)
             out = out.strip()
             meta["model_attempts"] += int(m.get("model_attempts", 1))
             meta["latency_sec_total"] += float(m.get("latency_sec_total", 0.0))
@@ -532,15 +557,11 @@ def process_seed(
     model_endpoint: str,
     seed_id: int,
     seed_text: str,
-    gen_config_base: GenerateContentConfig,
-    gen_config_diversity: GenerateContentConfig,
+    base_temp_scale: float,
+    diversity_temp_scale: float,
+    max_output_tokens: int,
     retries: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[float]]:
-    """
-    1 seed -> 8トーン生成
-    - 形式維持（ダメならリトライ）
-    - 多様性不足（ユニーク数/類似度）なら温度↑で再生成
-    """
     outputs: Dict[str, Optional[str]] = {}
     metas: Dict[str, Dict[str, Any]] = {}
     latencies: List[float] = []
@@ -548,7 +569,14 @@ def process_seed(
     # まず形式優先で8本
     for tone_id, tone_prompt in CONTEXTS:
         out, meta = generate_one_tone(
-            client, model_endpoint, seed_text, tone_prompt, gen_config_base, retries=retries
+            client,
+            model_endpoint,
+            seed_text,
+            tone_id=tone_id,
+            tone_prompt=tone_prompt,
+            base_temp_scale=base_temp_scale,
+            max_output_tokens=max_output_tokens,
+            retries=retries,
         )
         outputs[tone_id] = out
         metas[tone_id] = meta
@@ -558,38 +586,57 @@ def process_seed(
     ok_outputs = [outputs[tid] for tid in ok_ids if outputs[tid] is not None]
     unique_n = len({normalize_for_compare(o) for o in ok_outputs if o})
 
-    # 参照（business優先、なければ最初のOK）
-    ref_id = "business" if outputs.get("business") else (ok_ids[0] if ok_ids else None)
-    ref_out = outputs.get(ref_id) if ref_id else None
+    # --- ペアワイズで似すぎを潰す（数ラウンド） ---
+    def most_similar_pair(os: Dict[str, str]) -> Tuple[float, Optional[Tuple[str, str]]]:
+        ids = list(os.keys())
+        best = (-1.0, None)
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a_id, b_id = ids[i], ids[j]
+                sim = seq_similarity(os[a_id], os[b_id])
+                if sim > best[0]:
+                    best = (sim, (a_id, b_id))
+        return best
 
-    # 多様性不足なら、refに似すぎるものをdiversityで置換
-    if unique_n < MIN_UNIQUE_PER_SEED and ref_out is not None:
-        for tone_id, tone_prompt in CONTEXTS:
-            if tone_id == ref_id:
-                continue
-            cur = outputs.get(tone_id)
-            if cur is None:
-                continue
-            sim = seq_similarity(cur, ref_out)
-            if sim >= SIMILARITY_TOO_HIGH:
-                existing = [o for o in outputs.values() if o is not None]
-                new_out, dmeta = improve_diversity_for_tone(
-                    client,
-                    model_endpoint,
-                    seed_text,
-                    tone_prompt,
-                    existing_outputs=existing,
-                    gen_config_diversity=gen_config_diversity,
-                    retries=retries,
-                )
-                if new_out is not None:
-                    outputs[tone_id] = new_out
-                    metas[tone_id]["used_diversity_mode"] = True
-                    metas[tone_id]["diversity_attempts"] = int(dmeta.get("diversity_attempts", 0))
-                    metas[tone_id]["diversity_best_similarity"] = float(dmeta.get("best_similarity", 1.0))
-                    metas[tone_id]["latency_sec_total"] = float(metas[tone_id].get("latency_sec_total", 0.0)) + float(dmeta.get("latency_sec_total", 0.0))
-                    latencies.append(float(dmeta.get("latency_sec_total", 0.0)))
+    # 辞書化（None除外）
+    cur_map: Dict[str, str] = {k: v for k, v in outputs.items() if isinstance(v, str)}
+    for _round in range(PAIRWISE_DIVERSITY_ROUNDS):
+        if len(cur_map) < 2:
+            break
+        mx, pair = most_similar_pair(cur_map)
+        if pair is None or mx < SIMILARITY_TOO_HIGH:
+            break
 
+        # 似すぎるペアのうち、より「変更しても良さそう」な側を再生成
+        # ルール: business/polite/concise は固定寄りなので、相手側を優先して更新
+        a, b = pair
+        fixedish = {"business", "polite", "concise"}
+        target = b if a in fixedish and b not in fixedish else (a if b in fixedish and a not in fixedish else b)
+
+        # リトライ
+        existing = [v for k, v in cur_map.items() if k != target]
+        base_prompt = dict(CONTEXTS).get(target, "")
+        new_out, dmeta = improve_diversity_for_tone(
+            client,
+            model_endpoint,
+            seed_text,
+            tone_id=target,
+            base_tone_prompt=base_prompt,
+            existing_outputs=existing,
+            diversity_temp_scale=diversity_temp_scale,
+            max_output_tokens=max_output_tokens,
+            retries=retries,
+        )
+        if new_out is not None:
+            outputs[target] = new_out
+            cur_map[target] = new_out
+            metas[target]["used_diversity_mode"] = True
+            metas[target]["diversity_attempts"] = int(dmeta.get("diversity_attempts", 0))
+            metas[target]["diversity_best_similarity"] = float(dmeta.get("best_similarity", 1.0))
+            metas[target]["latency_sec_total"] = float(metas[target].get("latency_sec_total", 0.0)) + float(dmeta.get("latency_sec_total", 0.0))
+            latencies.append(float(dmeta.get("latency_sec_total", 0.0)))
+
+        # 再計算
         ok_ids = [tid for tid, o in outputs.items() if o is not None]
         ok_outputs = [outputs[tid] for tid in ok_ids if outputs[tid] is not None]
         unique_n = len({normalize_for_compare(o) for o in ok_outputs if o})
@@ -658,6 +705,8 @@ def process_seed(
             "format_score": format_score,
             "diversity_score": round(diversity_score, 6),
             "total_score": total_score,
+
+            "out_after_token_count": after_token_count(out),
         })
 
     return out_recs, seed_metrics, latencies
@@ -683,26 +732,17 @@ def main() -> None:
     ap.add_argument("--report-every", type=int, default=50)
     ap.add_argument("--random-seed", type=int, default=20251219)
 
-    # 生成パラメータをCLIで調整できるように
-    ap.add_argument("--max-output-tokens", type=int, default=BASE_MAX_OUTPUT_TOKENS_DEFAULT)
-    ap.add_argument("--temperature", type=float, default=BASE_TEMPERATURE_DEFAULT)
-    ap.add_argument("--diversity-temperature", type=float, default=DIVERSITY_TEMPERATURE_DEFAULT)
+    # 生成パラメータ
+    ap.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
+    ap.add_argument("--base-temp-scale", type=float, default=1.0)
+    ap.add_argument("--div-temp-scale", type=float, default=1.0)
+
+    # 再実行時の重複防止
+    ap.add_argument("--resume-skip-existing", action="store_true")
 
     args = ap.parse_args()
 
     random.seed(args.random_seed)
-
-    # 生成設定（基本 / 多様性）
-    gen_config_base = GenerateContentConfig(
-        temperature=float(args.temperature),
-        max_output_tokens=int(args.max_output_tokens),
-        thinking_config=ThinkingConfig(thinking_budget=0),
-    )
-    gen_config_diversity = GenerateContentConfig(
-        temperature=float(args.diversity_temperature),
-        max_output_tokens=int(args.max_output_tokens),
-        thinking_config=ThinkingConfig(thinking_budget=0),
-    )
 
     seed_path = Path(args.seed_jsonl)
     out_bison_path = Path(args.out_bison)
@@ -724,12 +764,16 @@ def main() -> None:
         print(f"[ERROR] no seeds found in {seed_path}", file=sys.stderr)
         sys.exit(1)
 
+    processed_pairs: Set[Tuple[str, str]] = set()
+    if args.resume_skip_existing:
+        processed_pairs = load_processed_pairs_from_bison(out_bison_path)
+        print(f"[INFO] resume: existing pairs={len(processed_pairs)}", file=sys.stderr)
+
     total = len(seeds)
     print(f"[INFO] seeds to process={total} (tones={len(CONTEXTS)})", file=sys.stderr)
-    print(f"[INFO] model endpoint default={TUNED_MODEL_ENDPOINT_DEFAULT}", file=sys.stderr)
+    print(f"[INFO] model endpoint={args.model_endpoint}", file=sys.stderr)
     print(
-        f"[INFO] gen_config: temp={args.temperature}, div_temp={args.diversity_temperature}, "
-        f"max_output_tokens={args.max_output_tokens}",
+        f"[INFO] max_output_tokens={args.max_output_tokens} base_temp_scale={args.base_temp_scale} div_temp_scale={args.div_temp_scale}",
         file=sys.stderr,
     )
 
@@ -764,8 +808,9 @@ def main() -> None:
                     args.model_endpoint,
                     seed_id,
                     seed_text,
-                    gen_config_base,
-                    gen_config_diversity,
+                    args.base_temp_scale,
+                    args.div_temp_scale,
+                    args.max_output_tokens,
                     args.retries,
                 )
             )
@@ -780,6 +825,22 @@ def main() -> None:
 
             if seedm.get("diversity_weak"):
                 seeds_div_weak += 1
+
+            if not recs:
+                done += 1
+                print_progress(done, total)
+                continue
+
+            # resume skip
+            if args.resume_skip_existing:
+                recs2 = []
+                for r in recs:
+                    key = (r["seed"], r["tone_id"])
+                    if key in processed_pairs:
+                        continue
+                    recs2.append(r)
+                    processed_pairs.add(key)
+                recs = recs2
 
             if not recs:
                 done += 1
