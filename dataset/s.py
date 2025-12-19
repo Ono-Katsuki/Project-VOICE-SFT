@@ -32,14 +32,7 @@ V1_BISON_JSONL_DEFAULT = (
 )
 
 # 出力ファイル
-OUT_BISON_JSONL_DEFAULT = (
-    "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v2/"
-    "voice_v2_synth_from_v1_bison.jsonl"
-)
-OUT_GEMINI_JSONL_DEFAULT = (
-    "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v2/"
-    "voice_v2_synth_from_v1_gemini_train.jsonl"
-)
+OUT_GEMINI_JSONL_DEFAULT = "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/voice_boundaryrule_ctxinout_prefix1to3_vark_onebest_gemini__strict_with_userprefix.jsonl"
 
 # 並列実行数
 MAX_WORKERS_DEFAULT = 4
