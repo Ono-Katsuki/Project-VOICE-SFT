@@ -28,15 +28,15 @@ except Exception:
 # ========= 設定ここから =========
 
 PROJECT_ID = "project-voice-476504"
-LOCATION = "us-central1"
+LOCATION = "us-central2"
 BUCKET_NAME = "project-voice-models"
-GCS_PREFIX = "gemini25_sft/run11"
+GCS_PREFIX = "gemini25_sft/run12"
 
-LOCAL_TRAIN_FILE = "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/voice_boundaryrule_ctxinout_prefix1to3_vark_onebest_gemini__strict_with_userprefix.jsonl"
+LOCAL_TRAIN_FILE = "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v12/voice_v11_list4_selected_from_tone8__strongtone_top10k_gemini.jsonl"
 LOCAL_VALID_FILE = ""
 
 SOURCE_MODEL = "gemini-2.5-flash"
-TUNED_MODEL_DISPLAY_NAME = "voice-v11"
+TUNED_MODEL_DISPLAY_NAME = "voice-v12"
 
 EPOCHS = 1
 ADAPTER_SIZE = None
