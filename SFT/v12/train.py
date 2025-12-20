@@ -28,7 +28,7 @@ except Exception:
 # ========= 設定ここから =========
 
 PROJECT_ID = "project-voice-476504"
-LOCATION = "us-central2"
+LOCATION = "us-central1"
 BUCKET_NAME = "project-voice-models"
 GCS_PREFIX = "gemini25_sft/run12"
 
