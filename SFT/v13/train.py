@@ -30,13 +30,13 @@ except Exception:
 PROJECT_ID = "project-voice-476504"
 LOCATION = "us-central1"
 BUCKET_NAME = "project-voice-models"
-GCS_PREFIX = "gemini25_sft/run12"
+GCS_PREFIX = "gemini25_sft/run13"
 
-LOCAL_TRAIN_FILE = "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v12/voice_v11_list4_selected_from_tone8__strongtone_top10k_gemini.jsonl"
+LOCAL_TRAIN_FILE = "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v13/joint_sent4_words8_from_tone8__strongtone_gemini.words8_wordsonly.top10k.jsonl"
 LOCAL_VALID_FILE = ""
 
 SOURCE_MODEL = "gemini-2.5-flash"
-TUNED_MODEL_DISPLAY_NAME = "voice-v12"
+TUNED_MODEL_DISPLAY_NAME = "voice-v13"
 
 EPOCHS = 1
 ADAPTER_SIZE = None
