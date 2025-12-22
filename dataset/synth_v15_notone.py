@@ -7,10 +7,12 @@ import time
 import random
 import threading
 import re
+import difflib
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
+from collections import Counter
 
 from google import genai
 from google.genai.types import GenerateContentConfig, ThinkingConfig
@@ -21,18 +23,15 @@ from google.genai.types import GenerateContentConfig, ThinkingConfig
 PROJECT_ID_DEFAULT = "project-voice-476504"
 LOCATION_DEFAULT = "us-central1"
 
-# ★v15 tuned endpointに差し替えて使う（CLIで上書き推奨）
 TUNED_MODEL_ENDPOINT_DEFAULT = (
     "projects/700129023625/locations/us-central1/endpoints/2363280397137084416"
 )
 
-# seedはv11のまま
 SEED_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
     "voice_boundaryrule_ctxinout_prefix1to3_vark_onebest_gemini__strict_with_userprefix.jsonl"
 )
 
-# 出力（v15）
 OUT_BISON_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v15/"
     "synth_v15_notone_bison.jsonl"
@@ -49,9 +48,16 @@ SEED_METRICS_JSONL_DEFAULT = (
 MAX_WORKERS_DEFAULT = 4
 MAX_MODEL_RETRIES_DEFAULT = -1  # -1: rate系のみ無限バックオフ
 
-DEFAULT_MAX_OUTPUT_TOKENS = 350
+DEFAULT_MAX_OUTPUT_TOKENS = 260
 DEFAULT_TEMPERATURE = 0.35
 DEFAULT_FORMAT_RETRIES = 3
+
+# 多様性リトライ（形式OKだが多様性NGの時）
+DEFAULT_DIVERSITY_RETRIES = 2
+
+# 多様性制約（IME想定）
+DEFAULT_MAX_AFTER_TOKS = 16
+DEFAULT_MAX_SENT_SIM = 0.88
 
 # --- seed 側に混ざる v11 prompt（フィルタ用） ---
 FIXED_PROMPT_HEADER_V11 = (
@@ -59,12 +65,29 @@ FIXED_PROMPT_HEADER_V11 = (
     "ユーザー入力と予測変換の間には境界 [---]を入れてください。"
 )
 
-# --- 生成に使う v15 prompt（今回これに統一） ---
+# --- 生成に使う v15 prompt（wordsは8固定に統一） ---
 FIXED_PROMPT_HEADER_V15 = (
     "キーボードの予測変換として[---]に続く異なる言葉を4つ予測変換してください。[---]より前はこれまでのユーザー入力です。\n"
     "ユーザー入力と予測変換の間には境界 [---]を入れてください。 \n\n"
     "またキーボードの予測変換として[---]に続く異なる単語を8つ予測変換してください。\n\n"
-    "{\"sentences\":[...4], \"words\":[...<=8]} 形式で答えてください。"
+    "{\"sentences\":[...4], \"words\":[...8]} 形式で答えてください。"
+)
+
+# ★多様性を強制する追加指示（markerより前に入る）
+DIVERSITY_INSTRUCTION = (
+    "【多様性制約】sentencesの4本は必ず方向性を変えてください。\n"
+    "1) 短い断定（[---]以降 8〜12トークン）\n"
+    "2) 疑問形（[---]以降 8〜14トークン）\n"
+    "3) 丁寧な依頼/提案（[---]以降 10〜16トークン）\n"
+    "4) カジュアル（[---]以降 10〜16トークン）\n"
+    "禁止: 4本が同じ言い回し/同じ構文の繰り返し。『と/思う』は4本中1回まで。\n"
+    "sentencesの[---]以降で、先頭の単語（1トークン目）は4本すべて異なるように。\n"
+)
+
+# 不適切寄り話題の禁止（IME用途向け）
+SENSITIVE_BAN_INSTRUCTION = (
+    "【内容制約】自傷・死・暴力・性的な内容、差別、個人情報の要求、過度に不快な内容は禁止。"
+    "そのような話題に寄らず、日常・仕事・学習・連絡など安全な内容で作成。\n"
 )
 
 # リトライ時にさらに強制する追加制約（markerより前に挿入）
@@ -76,8 +99,6 @@ STRICT_OUTPUT_SUFFIX = (
 
 MARKER_LINE = "ーーーー以下が予測変換対象ーーーー"
 PROGRESS_BAR_WIDTH = 50
-
-JSON_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\n|\n```$", re.MULTILINE)
 
 
 # --- 基本ユーティリティ ------------------------------------------------------
@@ -112,33 +133,31 @@ def _strip_prefix_once(text: str, prefix: str) -> str:
     return text
 
 def extract_seed_text(raw_user_text: str) -> str:
-    """
-    seedファイルに v11 prompt が混ざっていても、
-    最終的に seed 部分（例: '...context...[---]やま'）だけを返す。
-    """
     if not isinstance(raw_user_text, str):
         return ""
     t = raw_user_text.strip()
 
-    # まず marker があるなら最後の marker 以降が seed
     if MARKER_LINE in t:
         t = t.rsplit(MARKER_LINE, 1)[1].strip()
 
-    # それでも v11/v15 のヘッダが残るケースを削る（防御的に）
     changed = True
     while changed:
         before = t
         t = _strip_prefix_once(t, FIXED_PROMPT_HEADER_V11.strip())
         t = _strip_prefix_once(t, FIXED_PROMPT_HEADER_V15.strip())
+        t = _strip_prefix_once(t, DIVERSITY_INSTRUCTION.strip())
+        t = _strip_prefix_once(t, SENSITIVE_BAN_INSTRUCTION.strip())
         t = _strip_prefix_once(t, STRICT_OUTPUT_SUFFIX.strip())
         t = _strip_prefix_once(t, MARKER_LINE)
         changed = (t != before)
 
     return t.strip()
 
-def build_full_input(seed_text: str, extra_instruction: str = "") -> str:
+def build_full_input(seed_text: str, extra_instruction: str = "", ban_sensitive: bool = True) -> str:
     seed_text = extract_seed_text(seed_text)
-    parts = [FIXED_PROMPT_HEADER_V15]
+    parts = [FIXED_PROMPT_HEADER_V15, DIVERSITY_INSTRUCTION]
+    if ban_sensitive:
+        parts.append(SENSITIVE_BAN_INSTRUCTION)
     if extra_instruction.strip():
         parts.append(extra_instruction.strip())
     parts.append(MARKER_LINE)
@@ -146,27 +165,20 @@ def build_full_input(seed_text: str, extra_instruction: str = "") -> str:
     return "\n".join(parts)
 
 def parse_json_lenient(text: str) -> Dict[str, Any]:
-    """
-    - ```json ... ``` のフェンスを剥がす
-    - 先頭/末尾の余計な文字が混ざっても最初の {...} を抽出して読む
-    """
     t = (text or "").strip()
     if not t:
         raise ValueError("empty")
 
-    # fence removal
     if t.startswith("```"):
         t = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", t).strip()
         if t.endswith("```"):
             t = t[:-3].strip()
 
-    # direct parse
     try:
         return json.loads(t)
     except Exception:
         pass
 
-    # extract first JSON object span
     s = t.find("{")
     e = t.rfind("}")
     if s != -1 and e != -1 and e > s:
@@ -174,13 +186,40 @@ def parse_json_lenient(text: str) -> Dict[str, Any]:
 
     raise ValueError("json_parse_failed")
 
-def validate_output_json(seed_text: str, output_text: str, require_words8: bool = True) -> Tuple[bool, str, Dict[str, Any], Optional[Dict[str, Any]]]:
+def normalized_json_text(obj: Dict[str, Any]) -> str:
+    out = {
+        "sentences": obj.get("sentences", []),
+        "words": obj.get("words", []),
+    }
+    return json.dumps(out, ensure_ascii=False)
+
+def _after_tokens(sentence: str) -> List[str]:
+    if "[---]" not in sentence:
+        return []
+    after = sentence.split("[---]", 1)[1]
+    return [t for t in after.split("/") if t != ""]
+
+def _sent_after_norm(sentence: str) -> str:
+    return " ".join(_after_tokens(sentence)).strip()
+
+def _sim(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+SENSITIVE_PAT = re.compile(
+    r"(死|自殺|死ん|殺|殺し|首つ|首吊|リスカ|希死|消して|消し|遺書|暴力|レイプ|強姦|性行為|エロ|AV|ポルノ|裸|児童|虐待)",
+    re.IGNORECASE,
+)
+
+def validate_output_json(
+    seed_text: str,
+    output_text: str,
+    require_words8: bool = True,
+    max_after_toks: int = DEFAULT_MAX_AFTER_TOKS,
+    max_sent_sim: float = DEFAULT_MAX_SENT_SIM,
+    ban_sensitive: bool = True,
+) -> Tuple[bool, str, Dict[str, Any], Optional[Dict[str, Any]]]:
     """
-    v15: 出力が JSON 前提
-    - dict で sentences(list=4), words(list=8推奨)
-    - sentences は各要素が str
-    - words は各要素が str / 端空白なし / 重複なし / [---]やMARKERやスラッシュ含まない
-    - sentences 各行は [---] を1回含み、[---]前のコンテキストが seed と一致
+    形式 + 多様性 + 反復抑制 + (任意)センシティブ禁止
     """
     info: Dict[str, Any] = {}
     if not output_text:
@@ -211,16 +250,6 @@ def validate_output_json(seed_text: str, output_text: str, require_words8: bool 
         return False, "bad_seed_boundary_count", info, obj
     seed_ctx, _ = seed.split("[---]", 1)
 
-    # sentences check
-    for i, s in enumerate(sentences):
-        if not isinstance(s, str) or not s.strip():
-            return False, f"sentence_{i}_empty", info, obj
-        if s.count("[---]") != 1:
-            return False, f"sentence_{i}_bad_boundary_count", info, obj
-        s_ctx, _ = s.split("[---]", 1)
-        if s_ctx != seed_ctx:
-            return False, f"sentence_{i}_context_mismatch", info, obj
-
     # words check
     seen = set()
     clean_words: List[str] = []
@@ -240,17 +269,72 @@ def validate_output_json(seed_text: str, output_text: str, require_words8: bool 
         seen.add(w)
         clean_words.append(w)
 
-    info["sentences_count"] = len(sentences)
+    # sentences check + diversity constraints
+    after_norms: List[str] = []
+    first_tokens: List[str] = []
+    thought_cnt = 0
+
+    for i, s in enumerate(sentences):
+        if not isinstance(s, str) or not s.strip():
+            return False, f"sentence_{i}_empty", info, obj
+        if s.count("[---]") != 1:
+            return False, f"sentence_{i}_bad_boundary_count", info, obj
+        s_ctx, _ = s.split("[---]", 1)
+        if s_ctx != seed_ctx:
+            return False, f"sentence_{i}_context_mismatch", info, obj
+
+        # 센시티브禁止（sentences + words 全体で見る）
+        if ban_sensitive and SENSITIVE_PAT.search(s):
+            return False, "sensitive_in_sentences", info, obj
+
+        toks = _after_tokens(s)
+        if len(toks) < 1:
+            return False, f"sentence_{i}_len_lt1", info, obj
+        if len(toks) > max_after_toks:
+            return False, f"sentence_{i}_len_gt_{max_after_toks}", info, obj
+
+        if toks and toks[0]:
+            first_tokens.append(toks[0])
+
+        # 『と/思う』回数制限（例のような収束を減らす）
+        thought_cnt += sum(1 for t in toks if t in ("思う", "思います"))
+
+        # 反復抑制：同一tokenが3回以上はNG
+        c = Counter(toks)
+        if c and max(c.values()) >= 3:
+            return False, f"sentence_{i}_token_repeat", info, obj
+
+        # bigram反復（同一2-gramが2回以上）を抑制
+        if len(toks) >= 10:
+            bigrams = Counter(tuple(toks[j:j+2]) for j in range(len(toks)-1))
+            if bigrams and max(bigrams.values()) >= 2:
+                return False, f"sentence_{i}_bigram_repeat", info, obj
+
+        after_norms.append(" ".join(toks))
+
+    # thought limit
+    if thought_cnt >= 2:
+        return False, "thought_phrase_too_many", info, obj
+
+    # 先頭トークンの重複を強く抑える（4本ぜんぶ違うが理想）
+    if len(set(first_tokens)) < 4:
+        return False, "first_token_not_all_unique", info, obj
+
+    # sentences 同士が似すぎない
+    for i in range(4):
+        for j in range(i+1, 4):
+            if _sim(after_norms[i], after_norms[j]) > max_sent_sim:
+                return False, "sentences_too_similar", info, obj
+
+    # センシティブ禁止：words側も見る
+    if ban_sensitive:
+        for w in clean_words:
+            if SENSITIVE_PAT.search(w):
+                return False, "sensitive_in_words", info, obj
+
+    info["sentences_count"] = 4
     info["words_count"] = len(clean_words)
     return True, "ok", info, obj
-
-def normalized_json_text(obj: Dict[str, Any]) -> str:
-    # 余計なキーが混じる場合は落として正規化
-    out = {
-        "sentences": obj.get("sentences", []),
-        "words": obj.get("words", []),
-    }
-    return json.dumps(out, ensure_ascii=False)
 
 
 # --- モデル呼び出し（rateのみバックオフ） ------------------------------------
@@ -343,11 +427,9 @@ def load_seeds(seed_path: Path, dedup: bool = True) -> List[str]:
 
             raw: Optional[str] = None
 
-            # Bison
             if isinstance(obj, dict) and isinstance(obj.get("input_text"), str):
                 raw = obj["input_text"]
 
-            # Gemini
             elif isinstance(obj, dict) and "contents" in obj:
                 try:
                     contents = obj.get("contents", [])
@@ -399,9 +481,9 @@ def load_processed_seeds_from_bison(path: Path) -> Set[str]:
     return processed
 
 
-# --- seed 1本処理（生成＋評価＋フォーマットリトライ） --------------------------
+# --- 生成＋評価（形式＋多様性） ---------------------------------------------
 
-def generate_with_format_retry(
+def generate_with_retries(
     client: genai.Client,
     model_endpoint: str,
     seed_line: str,
@@ -409,33 +491,42 @@ def generate_with_format_retry(
     max_output_tokens: int,
     retries: int,
     format_retries: int,
+    diversity_retries: int,
     require_words8: bool,
+    max_after_toks: int,
+    max_sent_sim: float,
+    ban_sensitive: bool,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    format_retries 回まで「出力フォーマットがOKになるまで」再生成する。
-    rate系は call_model_once が内部でバックオフ。
-    """
     meta: Dict[str, Any] = {
+        "attempts_total": 0,
         "format_attempts": 0,
-        "format_ok": False,
-        "format_fail_reason": None,
+        "diversity_attempts": 0,
+        "ok": False,
+        "fail_reason": None,
         "model_attempts": 0,
         "latency_sec_total": 0.0,
         "latency_sec_last": 0.0,
     }
 
-    # 失敗時は追加制約を強くしていく
-    for k in range(format_retries + 1):
-        meta["format_attempts"] += 1
+    # まず format_retries+1 回は通常（多様性制約は常にvalidateする）
+    max_tries = (format_retries + 1) + diversity_retries
+
+    for k in range(max_tries):
+        meta["attempts_total"] += 1
+        if k <= format_retries:
+            meta["format_attempts"] += 1
+        else:
+            meta["diversity_attempts"] += 1
 
         extra = ""
         temp_k = temperature
+
+        # 失敗時は指示を強める＆温度を下げる
         if k >= 1:
-            extra = STRICT_OUTPUT_SUFFIX + f"（再試行{ k }回目：形式を厳守）"
-            # 再試行は少し温度を下げて安定化
+            extra = STRICT_OUTPUT_SUFFIX + f"（再試行{k}回目：形式と多様性を厳守）"
             temp_k = max(0.10, temperature * 0.75)
 
-        full_input = build_full_input(seed_line, extra_instruction=extra)
+        full_input = build_full_input(seed_line, extra_instruction=extra, ban_sensitive=ban_sensitive)
         cfg = make_config(temp_k, max_output_tokens)
 
         try:
@@ -444,19 +535,26 @@ def generate_with_format_retry(
             meta["latency_sec_total"] += float(m.get("latency_sec_total", 0.0))
             meta["latency_sec_last"] = float(m.get("latency_sec_last", 0.0))
         except Exception as e:
-            meta["format_fail_reason"] = f"call_error:{e}"
+            meta["fail_reason"] = f"call_error:{e}"
             continue
 
-        ok, reason, _, parsed = validate_output_json(seed_line, out, require_words8=require_words8)
+        ok, reason, _, parsed = validate_output_json(
+            seed_line,
+            out,
+            require_words8=require_words8,
+            max_after_toks=max_after_toks,
+            max_sent_sim=max_sent_sim,
+            ban_sensitive=ban_sensitive,
+        )
         if ok and parsed is not None:
-            meta["format_ok"] = True
-            meta["format_fail_reason"] = None
-            # 正規化JSONにして返す（学習データをクリーンに）
+            meta["ok"] = True
+            meta["fail_reason"] = None
             return normalized_json_text(parsed), meta
 
-        meta["format_fail_reason"] = reason
+        meta["fail_reason"] = reason
 
     return None, meta
+
 
 def process_seed_once(
     client: genai.Client,
@@ -467,11 +565,15 @@ def process_seed_once(
     max_output_tokens: int,
     retries: int,
     format_retries: int,
+    diversity_retries: int,
     require_words8: bool,
+    max_after_toks: int,
+    max_sent_sim: float,
+    ban_sensitive: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     seed_line = extract_seed_text(seed_text)
 
-    out_text, meta = generate_with_format_retry(
+    out_text, meta = generate_with_retries(
         client=client,
         model_endpoint=model_endpoint,
         seed_line=seed_line,
@@ -479,14 +581,17 @@ def process_seed_once(
         max_output_tokens=max_output_tokens,
         retries=retries,
         format_retries=format_retries,
+        diversity_retries=diversity_retries,
         require_words8=require_words8,
+        max_after_toks=max_after_toks,
+        max_sent_sim=max_sent_sim,
+        ban_sensitive=ban_sensitive,
     )
 
     status = "ok" if out_text is not None else "fail"
-    format_ok = bool(meta.get("format_ok", False))
-    fail_reason = meta.get("format_fail_reason")
+    ok_flag = bool(meta.get("ok", False))
+    fail_reason = meta.get("fail_reason")
 
-    # counts for metrics
     sentences_count = 0
     words_count = 0
     if out_text is not None:
@@ -497,7 +602,7 @@ def process_seed_once(
         except Exception:
             pass
 
-    full_input_for_log = build_full_input(seed_line)  # ログ用（追加制約なしの素の入力）
+    full_input_for_log = build_full_input(seed_line, ban_sensitive=ban_sensitive)
 
     rec = {
         "seed_id": seed_id,
@@ -506,15 +611,21 @@ def process_seed_once(
         "output_text": out_text,
         "status": status,
 
-        "format_ok": format_ok,
-        "format_fail_reason": None if format_ok else fail_reason,
+        "format_ok": ok_flag,
+        "format_fail_reason": None if ok_flag else fail_reason,
 
         "temperature": float(temperature),
         "max_output_tokens": int(max_output_tokens),
         "format_retries": int(format_retries),
+        "diversity_retries": int(diversity_retries),
         "require_words8": bool(require_words8),
+        "max_after_toks": int(max_after_toks),
+        "max_sent_sim": float(max_sent_sim),
+        "ban_sensitive": bool(ban_sensitive),
 
+        "attempts_total": int(meta.get("attempts_total", 0)),
         "format_attempts": int(meta.get("format_attempts", 0)),
+        "diversity_attempts": int(meta.get("diversity_attempts", 0)),
         "model_attempts": int(meta.get("model_attempts", 0)),
         "latency_sec_last": round(float(meta.get("latency_sec_last", 0.0)), 6),
         "latency_sec_total": round(float(meta.get("latency_sec_total", 0.0)), 6),
@@ -527,11 +638,13 @@ def process_seed_once(
         "seed_id": seed_id,
         "seed": seed_line,
         "status": status,
-        "format_ok": format_ok,
+        "format_ok": ok_flag,
         "format_fail_reason": rec["format_fail_reason"],
         "sentences_count": int(sentences_count),
         "words_count": int(words_count),
+        "attempts_total": rec["attempts_total"],
         "format_attempts": rec["format_attempts"],
+        "diversity_attempts": rec["diversity_attempts"],
         "model_attempts": rec["model_attempts"],
         "latency_sec_last": rec["latency_sec_last"],
         "latency_sec_total": rec["latency_sec_total"],
@@ -544,7 +657,7 @@ def process_seed_once(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="v15 tuned modelで合成（トーン無し / seedごと生成 / JSON形式評価＋フォーマットリトライ）"
+        description="v15 tuned modelで合成（トーン無し / seedごと生成 / JSON形式 + 多様性 + 反復抑制 + リトライ）"
     )
     ap.add_argument("--project-id", default=PROJECT_ID_DEFAULT)
     ap.add_argument("--location", default=LOCATION_DEFAULT)
@@ -564,21 +677,23 @@ def main() -> None:
     ap.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
     ap.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
 
-    # ★追加：フォーマットリトライ
     ap.add_argument("--format-retries", type=int, default=DEFAULT_FORMAT_RETRIES)
+    ap.add_argument("--diversity-retries", type=int, default=DEFAULT_DIVERSITY_RETRIES)
 
-    # ★追加：words=8を必須にする（高品質デフォルトON）
+    ap.add_argument("--max-after-toks", type=int, default=DEFAULT_MAX_AFTER_TOKS)
+    ap.add_argument("--max-sent-sim", type=float, default=DEFAULT_MAX_SENT_SIM)
+
     ap.add_argument("--allow-words-le8", action="store_true")
+    ap.add_argument("--ban-sensitive-off", action="store_true")
 
     ap.add_argument("--resume-skip-existing", action="store_true")
-
-    # ★おすすめ：学習用としてはOKのみ吐く
     ap.add_argument("--only-ok", action="store_true")
 
     args = ap.parse_args()
     random.seed(args.random_seed)
 
     require_words8 = (not args.allow_words_le8)
+    ban_sensitive = (not args.ban_sensitive_off)
 
     seed_path = Path(args.seed_jsonl)
     out_bison_path = Path(args.out_bison)
@@ -600,18 +715,19 @@ def main() -> None:
         print(f"[ERROR] no seeds found in {seed_path}", file=sys.stderr)
         sys.exit(1)
 
-    processed_seeds: Set[str] = set()
     if args.resume_skip_existing:
-        processed_seeds = load_processed_seeds_from_bison(out_bison_path)
-        print(f"[INFO] resume: existing seeds={len(processed_seeds)}", file=sys.stderr)
-        seeds = [s for s in seeds if extract_seed_text(s) not in processed_seeds]
+        processed = load_processed_seeds_from_bison(out_bison_path)
+        print(f"[INFO] resume: existing seeds={len(processed)}", file=sys.stderr)
+        seeds = [s for s in seeds if extract_seed_text(s) not in processed]
 
     total = len(seeds)
     print(f"[INFO] seeds to process={total}", file=sys.stderr)
     print(f"[INFO] model endpoint={args.model_endpoint}", file=sys.stderr)
     print(
         f"[INFO] temperature={args.temperature} max_output_tokens={args.max_output_tokens} "
-        f"format_retries={args.format_retries} require_words8={require_words8} max_workers={args.max_workers}",
+        f"format_retries={args.format_retries} diversity_retries={args.diversity_retries} "
+        f"max_after_toks={args.max_after_toks} max_sent_sim={args.max_sent_sim} "
+        f"require_words8={require_words8} ban_sensitive={ban_sensitive} max_workers={args.max_workers}",
         file=sys.stderr,
     )
 
@@ -626,8 +742,6 @@ def main() -> None:
     print_progress(done, total)
 
     ok_count = 0
-    fmt_ok_count = 0
-    good_count = 0
     latencies: List[float] = []
 
     max_workers = max(1, min(args.max_workers, 50))
@@ -646,19 +760,19 @@ def main() -> None:
                     args.max_output_tokens,
                     args.retries,
                     args.format_retries,
+                    args.diversity_retries,
                     require_words8,
+                    args.max_after_toks,
+                    args.max_sent_sim,
+                    ban_sensitive,
                 )
             )
 
         for fut in as_completed(futures):
             rec, seedm = fut.result()
 
-            if seedm["status"] == "ok":
+            if seedm["status"] == "ok" and seedm["format_ok"]:
                 ok_count += 1
-            if seedm["format_ok"]:
-                fmt_ok_count += 1
-            if seedm.get("sentences_count") == 4 and (seedm.get("words_count") == 8 or (not require_words8 and seedm.get("words_count", 0) <= 8)):
-                good_count += 1
             if seedm.get("latency_sec_last", 0.0) > 0:
                 latencies.append(float(seedm["latency_sec_last"]))
 
@@ -688,11 +802,8 @@ def main() -> None:
                 p50 = lat_sorted[int((len(lat_sorted)-1)*0.50)] if lat_sorted else 0.0
                 p90 = lat_sorted[int((len(lat_sorted)-1)*0.90)] if lat_sorted else 0.0
                 ok_rate = ok_count / done if done else 0.0
-                fmt_rate = fmt_ok_count / done if done else 0.0
-                good_rate = good_count / done if done else 0.0
                 print(
-                    f"\n[LOG] done={done}/{total} ok_rate={ok_rate:.4f} format_ok_rate={fmt_rate:.4f} "
-                    f"good_rate={good_rate:.4f} latency_p50={p50:.3f}s p90={p90:.3f}s",
+                    f"\n[LOG] done={done}/{total} ok_rate={ok_rate:.4f} latency_p50={p50:.3f}s p90={p90:.3f}s",
                     file=sys.stderr,
                 )
 
@@ -706,15 +817,11 @@ def main() -> None:
     p50 = lat_sorted[int((len(lat_sorted)-1)*0.50)] if lat_sorted else 0.0
     p90 = lat_sorted[int((len(lat_sorted)-1)*0.90)] if lat_sorted else 0.0
     ok_rate = ok_count / total if total else 0.0
-    fmt_rate = fmt_ok_count / total if total else 0.0
-    good_rate = good_count / total if total else 0.0
 
     print(
         "\n[REPORT]\n"
         f"  seeds_processed: {total}\n"
         f"  ok_rate        : {ok_rate:.6f}\n"
-        f"  format_ok_rate : {fmt_rate:.6f}\n"
-        f"  good_rate      : {good_rate:.6f}\n"
         f"  latency_sec p50/p90 : {p50:.3f}s / {p90:.3f}s\n"
         f"\n[INFO] outputs:\n"
         f"  Bison       : {out_bison_path}\n"
