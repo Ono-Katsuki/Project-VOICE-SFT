@@ -23,15 +23,18 @@ from google.genai.types import GenerateContentConfig, ThinkingConfig
 PROJECT_ID_DEFAULT = "project-voice-476504"
 LOCATION_DEFAULT = "us-central1"
 
+# ★v15 tuned endpoint（CLIで上書き可）
 TUNED_MODEL_ENDPOINT_DEFAULT = (
     "projects/700129023625/locations/us-central1/endpoints/2363280397137084416"
 )
 
+# seedはv11のまま
 SEED_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v11/"
     "voice_boundaryrule_ctxinout_prefix1to3_vark_onebest_gemini__strict_with_userprefix.jsonl"
 )
 
+# 出力（v15）
 OUT_BISON_JSONL_DEFAULT = (
     "/Users/onokatsuki/Documents/GitHub/Project-VOICE-SFT/SFT/v15/"
     "synth_v15_notone_bison.jsonl"
@@ -51,13 +54,12 @@ MAX_MODEL_RETRIES_DEFAULT = -1  # -1: rate系のみ無限バックオフ
 DEFAULT_MAX_OUTPUT_TOKENS = 260
 DEFAULT_TEMPERATURE = 0.35
 DEFAULT_FORMAT_RETRIES = 3
-
-# 多様性リトライ（形式OKだが多様性NGの時）
 DEFAULT_DIVERSITY_RETRIES = 2
 
-# 多様性制約（IME想定）
-DEFAULT_MAX_AFTER_TOKS = 16
-DEFAULT_MAX_SENT_SIM = 0.88
+# 多様性/ループ抑制（現実的に通る強さ）
+DEFAULT_MAX_AFTER_TOKS = 24
+DEFAULT_MAX_SENT_SIM = 0.95
+DEFAULT_MIN_UNIQUE_SENT = 3  # after部が最低3ユニーク
 
 # --- seed 側に混ざる v11 prompt（フィルタ用） ---
 FIXED_PROMPT_HEADER_V11 = (
@@ -65,23 +67,22 @@ FIXED_PROMPT_HEADER_V11 = (
     "ユーザー入力と予測変換の間には境界 [---]を入れてください。"
 )
 
-# --- 生成に使う v15 prompt（wordsは8固定に統一） ---
+# --- 生成に使う v15 prompt（words=8固定） ---
 FIXED_PROMPT_HEADER_V15 = (
     "キーボードの予測変換として[---]に続く異なる言葉を4つ予測変換してください。[---]より前はこれまでのユーザー入力です。\n"
-    "ユーザー入力と予測変換の間には境界 [---]を入れてください。 \n\n"
-    "またキーボードの予測変換として[---]に続く異なる単語を8つ予測変換してください。\n\n"
+    "ユーザー入力と予測変換の間には境界 [---]を入れてください。\n"
+    "【重要】[---]より前の文字列は1文字も変更せず、そのまま出力してください。\n\n"
+    "またキーボードの予測変換として[---]に続く異なる単語を8つ予測変換してください。\n"
+    "sentences の各要素は、[---]より後を / 区切りで出力してください。\n\n"
     "{\"sentences\":[...4], \"words\":[...8]} 形式で答えてください。"
 )
 
-# ★多様性を強制する追加指示（markerより前に入る）
+# ★多様性を促す指示（“通る”レベル）
 DIVERSITY_INSTRUCTION = (
-    "【多様性制約】sentencesの4本は必ず方向性を変えてください。\n"
-    "1) 短い断定（[---]以降 8〜12トークン）\n"
-    "2) 疑問形（[---]以降 8〜14トークン）\n"
-    "3) 丁寧な依頼/提案（[---]以降 10〜16トークン）\n"
-    "4) カジュアル（[---]以降 10〜16トークン）\n"
-    "禁止: 4本が同じ言い回し/同じ構文の繰り返し。『と/思う』は4本中1回まで。\n"
-    "sentencesの[---]以降で、先頭の単語（1トークン目）は4本すべて異なるように。\n"
+    "【多様性制約】sentencesの4本は、意味・話題・文末表現をできるだけ変えてください。\n"
+    "例：断定 / 疑問 / 依頼 / 提案 / カジュアル などを混ぜる。\n"
+    "禁止：4本がほぼ同じ言い回し（語尾だけ違う等）。\n"
+    "『と/思う』『と思います』は4本中2回まで。\n"
 )
 
 # 不適切寄り話題の禁止（IME用途向け）
@@ -90,7 +91,7 @@ SENSITIVE_BAN_INSTRUCTION = (
     "そのような話題に寄らず、日常・仕事・学習・連絡など安全な内容で作成。\n"
 )
 
-# リトライ時にさらに強制する追加制約（markerより前に挿入）
+# リトライ時の強制（JSON/words）
 STRICT_OUTPUT_SUFFIX = (
     "【出力制約】返答はJSONオブジェクト1個のみ。前後に説明文・Markdown・コードブロックを付けない。\n"
     "sentencesは必ず長さ4。\n"
@@ -99,6 +100,12 @@ STRICT_OUTPUT_SUFFIX = (
 
 MARKER_LINE = "ーーーー以下が予測変換対象ーーーー"
 PROGRESS_BAR_WIDTH = 50
+
+# センシティブ検知（IME向けに粗く弾く）
+SENSITIVE_PAT = re.compile(
+    r"(死|自殺|死ん|殺|殺し|首つ|首吊|リスカ|希死|遺書|暴力|レイプ|強姦|性行為|エロ|AV|ポルノ|裸|児童|虐待)",
+    re.IGNORECASE,
+)
 
 
 # --- 基本ユーティリティ ------------------------------------------------------
@@ -133,6 +140,10 @@ def _strip_prefix_once(text: str, prefix: str) -> str:
     return text
 
 def extract_seed_text(raw_user_text: str) -> str:
+    """
+    seedファイルに v11/v15 prompt が混ざっていても、
+    最終的に seed 部分（例: '...context...[---]やま'）だけを返す。
+    """
     if not isinstance(raw_user_text, str):
         return ""
     t = raw_user_text.strip()
@@ -165,6 +176,10 @@ def build_full_input(seed_text: str, extra_instruction: str = "", ban_sensitive:
     return "\n".join(parts)
 
 def parse_json_lenient(text: str) -> Dict[str, Any]:
+    """
+    - ```json ... ``` のフェンスを剥がす
+    - 先頭/末尾の余計な文字が混ざっても最初の {...} を抽出して読む
+    """
     t = (text or "").strip()
     if not t:
         raise ValueError("empty")
@@ -199,16 +214,32 @@ def _after_tokens(sentence: str) -> List[str]:
     after = sentence.split("[---]", 1)[1]
     return [t for t in after.split("/") if t != ""]
 
-def _sent_after_norm(sentence: str) -> str:
-    return " ".join(_after_tokens(sentence)).strip()
-
 def _sim(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
-SENSITIVE_PAT = re.compile(
-    r"(死|自殺|死ん|殺|殺し|首つ|首吊|リスカ|希死|消して|消し|遺書|暴力|レイプ|強姦|性行為|エロ|AV|ポルノ|裸|児童|虐待)",
-    re.IGNORECASE,
-)
+def hint_for_reason(reason: Optional[str], max_after_toks: int, max_sent_sim: float) -> str:
+    if not reason:
+        return ""
+    if reason == "json_parse_failed":
+        return "前回はJSONとして解釈できませんでした。必ずJSONオブジェクト1個だけを返し、先頭は{、末尾は}で終えてください。"
+    if reason == "words_has_duplicates":
+        return "前回wordsに重複がありました。wordsは必ず8個すべて異なる単語にしてください。"
+    if reason == "bad_words_len_not_8":
+        return "前回wordsの個数が8ではありませんでした。wordsは必ず8個ちょうどにしてください。"
+    if reason and reason.startswith("sentence_") and "len_gt_" in reason:
+        return f"sentences各要素の[---]以降は / 区切りで最大{max_after_toks}トークン以内にしてください。"
+    if reason == "sentences_too_similar":
+        return f"4文が似すぎています。語彙・語尾・話題を変えてください（語尾だけ変更は禁止）。類似度は{max_sent_sim}未満を目標。"
+    if reason == "sentences_not_diverse":
+        return "4文の内容が似ています。話題や文末（断定/疑問/依頼/提案/カジュアル）を混ぜてください。"
+    if reason == "thought_phrase_too_many":
+        return "『思う/思います』の多用は禁止。4文中2回までにしてください。"
+    if reason == "sensitive_in_sentences" or reason == "sensitive_in_words":
+        return "センシティブな話題は禁止です。安全な日常・仕事・学習・連絡の内容にしてください。"
+    return ""
+
+
+# --- 出力検証（形式＋多様性＋反復抑制） --------------------------------------
 
 def validate_output_json(
     seed_text: str,
@@ -217,10 +248,8 @@ def validate_output_json(
     max_after_toks: int = DEFAULT_MAX_AFTER_TOKS,
     max_sent_sim: float = DEFAULT_MAX_SENT_SIM,
     ban_sensitive: bool = True,
+    min_unique_sent: int = DEFAULT_MIN_UNIQUE_SENT,
 ) -> Tuple[bool, str, Dict[str, Any], Optional[Dict[str, Any]]]:
-    """
-    形式 + 多様性 + 反復抑制 + (任意)センシティブ禁止
-    """
     info: Dict[str, Any] = {}
     if not output_text:
         return False, "empty_output", info, None
@@ -262,16 +291,17 @@ def validate_output_json(
             return False, f"word_{i}_edge_space", info, obj
         if "[---]" in w or MARKER_LINE in w:
             return False, f"word_{i}_has_boundary_or_marker", info, obj
-        if "/" in w:
-            return False, f"word_{i}_has_slash", info, obj
+        if "/" in w or " " in w:
+            return False, f"word_{i}_has_slash_or_space", info, obj
         if w in seen:
             return False, "words_has_duplicates", info, obj
+        if ban_sensitive and SENSITIVE_PAT.search(w):
+            return False, "sensitive_in_words", info, obj
         seen.add(w)
         clean_words.append(w)
 
-    # sentences check + diversity constraints
     after_norms: List[str] = []
-    first_tokens: List[str] = []
+    after_lens: List[int] = []
     thought_cnt = 0
 
     for i, s in enumerate(sentences):
@@ -279,58 +309,54 @@ def validate_output_json(
             return False, f"sentence_{i}_empty", info, obj
         if s.count("[---]") != 1:
             return False, f"sentence_{i}_bad_boundary_count", info, obj
+
         s_ctx, _ = s.split("[---]", 1)
         if s_ctx != seed_ctx:
             return False, f"sentence_{i}_context_mismatch", info, obj
 
-        # 센시티브禁止（sentences + words 全体で見る）
         if ban_sensitive and SENSITIVE_PAT.search(s):
             return False, "sensitive_in_sentences", info, obj
 
         toks = _after_tokens(s)
-        if len(toks) < 1:
+        L = len(toks)
+        if L < 1:
             return False, f"sentence_{i}_len_lt1", info, obj
-        if len(toks) > max_after_toks:
+        if L > max_after_toks:
             return False, f"sentence_{i}_len_gt_{max_after_toks}", info, obj
 
-        if toks and toks[0]:
-            first_tokens.append(toks[0])
-
-        # 『と/思う』回数制限（例のような収束を減らす）
+        # 『思う』は多用しがちなので上限を設ける（緩め）
         thought_cnt += sum(1 for t in toks if t in ("思う", "思います"))
 
-        # 反復抑制：同一tokenが3回以上はNG
+        # token反復：4回以上でNG（緩め）
         c = Counter(toks)
-        if c and max(c.values()) >= 3:
+        if c and max(c.values()) >= 4:
             return False, f"sentence_{i}_token_repeat", info, obj
 
-        # bigram反復（同一2-gramが2回以上）を抑制
-        if len(toks) >= 10:
-            bigrams = Counter(tuple(toks[j:j+2]) for j in range(len(toks)-1))
-            if bigrams and max(bigrams.values()) >= 2:
+        # bigram反復：長めの時だけ見て 3回以上でNG（緩め）
+        if L >= 16:
+            bigrams = Counter(tuple(toks[j:j+2]) for j in range(L - 1))
+            if bigrams and max(bigrams.values()) >= 3:
                 return False, f"sentence_{i}_bigram_repeat", info, obj
 
         after_norms.append(" ".join(toks))
+        after_lens.append(L)
 
-    # thought limit
-    if thought_cnt >= 2:
+    if thought_cnt >= 3:
         return False, "thought_phrase_too_many", info, obj
 
-    # 先頭トークンの重複を強く抑える（4本ぜんぶ違うが理想）
-    if len(set(first_tokens)) < 4:
-        return False, "first_token_not_all_unique", info, obj
+    # 4文が“ほぼ同じ”を避ける：ユニーク数が最低min_unique_sent
+    if len(set(after_norms)) < min_unique_sent:
+        return False, "sentences_not_diverse", info, obj
 
-    # sentences 同士が似すぎない
+    # 長さバリエーションがゼロ（全部同じ長さ）ならNG（弱い制約）
+    if len(set(after_lens)) < 2:
+        return False, "sentences_length_not_diverse", info, obj
+
+    # sentences 同士の類似度を抑制（現実的：0.95）
     for i in range(4):
-        for j in range(i+1, 4):
+        for j in range(i + 1, 4):
             if _sim(after_norms[i], after_norms[j]) > max_sent_sim:
                 return False, "sentences_too_similar", info, obj
-
-    # センシティブ禁止：words側も見る
-    if ban_sensitive:
-        for w in clean_words:
-            if SENSITIVE_PAT.search(w):
-                return False, "sensitive_in_words", info, obj
 
     info["sentences_count"] = 4
     info["words_count"] = len(clean_words)
@@ -427,9 +453,11 @@ def load_seeds(seed_path: Path, dedup: bool = True) -> List[str]:
 
             raw: Optional[str] = None
 
+            # Bison
             if isinstance(obj, dict) and isinstance(obj.get("input_text"), str):
                 raw = obj["input_text"]
 
+            # Gemini
             elif isinstance(obj, dict) and "contents" in obj:
                 try:
                     contents = obj.get("contents", [])
@@ -481,7 +509,7 @@ def load_processed_seeds_from_bison(path: Path) -> Set[str]:
     return processed
 
 
-# --- 生成＋評価（形式＋多様性） ---------------------------------------------
+# --- seed 1本処理（生成＋評価＋リトライ） -------------------------------------
 
 def generate_with_retries(
     client: genai.Client,
@@ -495,8 +523,14 @@ def generate_with_retries(
     require_words8: bool,
     max_after_toks: int,
     max_sent_sim: float,
+    min_unique_sent: int,
     ban_sensitive: bool,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    - format_retries: 形式が崩れた時のリトライ
+    - diversity_retries: 形式OKだが多様性NGの時の追加リトライ
+    - 失敗reasonを次の入力にフィードバックして改善
+    """
     meta: Dict[str, Any] = {
         "attempts_total": 0,
         "format_attempts": 0,
@@ -508,7 +542,8 @@ def generate_with_retries(
         "latency_sec_last": 0.0,
     }
 
-    # まず format_retries+1 回は通常（多様性制約は常にvalidateする）
+    last_reason: Optional[str] = None
+
     max_tries = (format_retries + 1) + diversity_retries
 
     for k in range(max_tries):
@@ -521,10 +556,15 @@ def generate_with_retries(
         extra = ""
         temp_k = temperature
 
-        # 失敗時は指示を強める＆温度を下げる
         if k >= 1:
-            extra = STRICT_OUTPUT_SUFFIX + f"（再試行{k}回目：形式と多様性を厳守）"
-            temp_k = max(0.10, temperature * 0.75)
+            extra = STRICT_OUTPUT_SUFFIX + f"（再試行{k}回目：形式と多様性を厳守）\n"
+            extra += hint_for_reason(last_reason, max_after_toks, max_sent_sim)
+
+            # ★形式NGは温度↓、多様性NGは温度↑
+            if k <= format_retries:
+                temp_k = max(0.10, temperature * 0.75)
+            else:
+                temp_k = min(0.85, temperature * 1.15)
 
         full_input = build_full_input(seed_line, extra_instruction=extra, ban_sensitive=ban_sensitive)
         cfg = make_config(temp_k, max_output_tokens)
@@ -535,7 +575,8 @@ def generate_with_retries(
             meta["latency_sec_total"] += float(m.get("latency_sec_total", 0.0))
             meta["latency_sec_last"] = float(m.get("latency_sec_last", 0.0))
         except Exception as e:
-            meta["fail_reason"] = f"call_error:{e}"
+            last_reason = f"call_error:{e}"
+            meta["fail_reason"] = last_reason
             continue
 
         ok, reason, _, parsed = validate_output_json(
@@ -545,12 +586,15 @@ def generate_with_retries(
             max_after_toks=max_after_toks,
             max_sent_sim=max_sent_sim,
             ban_sensitive=ban_sensitive,
+            min_unique_sent=min_unique_sent,
         )
+
         if ok and parsed is not None:
             meta["ok"] = True
             meta["fail_reason"] = None
             return normalized_json_text(parsed), meta
 
+        last_reason = reason
         meta["fail_reason"] = reason
 
     return None, meta
@@ -569,6 +613,7 @@ def process_seed_once(
     require_words8: bool,
     max_after_toks: int,
     max_sent_sim: float,
+    min_unique_sent: int,
     ban_sensitive: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     seed_line = extract_seed_text(seed_text)
@@ -585,6 +630,7 @@ def process_seed_once(
         require_words8=require_words8,
         max_after_toks=max_after_toks,
         max_sent_sim=max_sent_sim,
+        min_unique_sent=min_unique_sent,
         ban_sensitive=ban_sensitive,
     )
 
@@ -619,8 +665,10 @@ def process_seed_once(
         "format_retries": int(format_retries),
         "diversity_retries": int(diversity_retries),
         "require_words8": bool(require_words8),
+
         "max_after_toks": int(max_after_toks),
         "max_sent_sim": float(max_sent_sim),
+        "min_unique_sent": int(min_unique_sent),
         "ban_sensitive": bool(ban_sensitive),
 
         "attempts_total": int(meta.get("attempts_total", 0)),
@@ -682,6 +730,7 @@ def main() -> None:
 
     ap.add_argument("--max-after-toks", type=int, default=DEFAULT_MAX_AFTER_TOKS)
     ap.add_argument("--max-sent-sim", type=float, default=DEFAULT_MAX_SENT_SIM)
+    ap.add_argument("--min-unique-sent", type=int, default=DEFAULT_MIN_UNIQUE_SENT)
 
     ap.add_argument("--allow-words-le8", action="store_true")
     ap.add_argument("--ban-sensitive-off", action="store_true")
@@ -727,7 +776,8 @@ def main() -> None:
         f"[INFO] temperature={args.temperature} max_output_tokens={args.max_output_tokens} "
         f"format_retries={args.format_retries} diversity_retries={args.diversity_retries} "
         f"max_after_toks={args.max_after_toks} max_sent_sim={args.max_sent_sim} "
-        f"require_words8={require_words8} ban_sensitive={ban_sensitive} max_workers={args.max_workers}",
+        f"min_unique_sent={args.min_unique_sent} require_words8={require_words8} "
+        f"ban_sensitive={ban_sensitive} max_workers={args.max_workers}",
         file=sys.stderr,
     )
 
@@ -764,6 +814,7 @@ def main() -> None:
                     require_words8,
                     args.max_after_toks,
                     args.max_sent_sim,
+                    args.min_unique_sent,
                     ban_sensitive,
                 )
             )
