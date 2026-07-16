@@ -1,0 +1,16 @@
+# Dependencies for this repository (SFT launcher + dataset scripts).
+# The Gemma 3 270M SFT+DPO notebook shipped in the paper's supplementary
+# bundle has its own dependency set (torch / transformers / trl /
+# datasets / peft / accelerate) — see the notebook's install cells.
+
+# SFT (Vertex AI Gemini 2.5 Flash tuning launcher and per-version train.py)
+google-cloud-aiplatform>=1.60.0
+google-cloud-storage>=2.10.0
+google-genai>=0.3.0
+
+# dataset/ extractors and data-processing utilities
+google-api-python-client>=2.143.0
+google-auth>=2.34.0
+google-auth-httplib2>=0.2.0
+python-dateutil>=2.9.0
+tqdm>=4.66.0

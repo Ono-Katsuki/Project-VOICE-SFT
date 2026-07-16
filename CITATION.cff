@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite the accompanying ASSETS 2026 paper.
+title: "Project VOICE — Gemini SFT pipeline"
+type: software
+authors:
+  - family-names: Ono
+    given-names: Katsuki
+    affiliation: Minority Research Center / EqualFrontiers
+repository-code: "https://github.com/Ono-Katsuki/Project-VOICE-SFT"
+license: Apache-2.0
+preferred-citation:
+  type: conference-paper
+  title: >-
+    Reconfiguration of Ability: An Autoethnography of LLM-Mediated Development
+    by a Developer with Severe Physical Disability
+  authors:
+    - family-names: Ono
+      given-names: Katsuki
+  year: 2026
+  collection-title: >-
+    The 28th International ACM SIGACCESS Conference on Computers and
+    Accessibility (ASSETS '26)
+  publisher:
+    name: Association for Computing Machinery
+  doi: 10.1145/3797867.3828990
